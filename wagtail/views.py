@@ -3,33 +3,40 @@ from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.generic import View
 
 from wagtail import hooks
 from wagtail.forms import PasswordViewRestrictionForm
 from wagtail.models import Page, PageViewRestriction
+from wagtail.request_context import with_request
 
 
 def serve_chain(page, request, args, kwargs):
     return page.serve(request, *args, **kwargs)
 
 
-def serve(request, path):
-    route_result = Page.route_for_request(request, path)
-    if route_result is None:
-        raise Http404
-    else:
+class ServeView(View):
+    def dispatch(self, request, path):
+        route_result = Page.route_for_request(request, path)
+        if route_result is None:
+            raise Http404
+
         page, args, kwargs = route_result
 
-    on_serve_chain = serve_chain
-    for fn in reversed(hooks.get_hooks("on_serve_page")):
-        on_serve_chain = fn(on_serve_chain)
+        on_serve_chain = serve_chain
+        for fn in reversed(hooks.get_hooks("on_serve_page")):
+            on_serve_chain = fn(on_serve_chain)
 
-    for fn in hooks.get_hooks("before_serve_page"):
-        result = fn(page, request, args, kwargs)
-        if isinstance(result, HttpResponse):
-            return result
+        for fn in hooks.get_hooks("before_serve_page"):
+            result = fn(page, request, args, kwargs)
+            if isinstance(result, HttpResponse):
+                return result
 
-    return on_serve_chain(page, request, args, kwargs)
+        with with_request(request):
+            response = on_serve_chain(page, request, args, kwargs)
+            if hasattr(response, "render"):
+                response.render()
+            return response
 
 
 def authenticate_with_password(request, page_view_restriction_id, page_id):
