@@ -35,5 +35,5 @@ urlpatterns = [
     ),
     # Front-end page views are handled through Wagtail's core.views.serve
     # mechanism
-    re_path(serve_pattern, views.serve, name="wagtail_serve"),
+    re_path(serve_pattern, views.ServeView.as_view(), name="wagtail_serve"),
 ]
