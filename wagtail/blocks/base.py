@@ -1,7 +1,9 @@
 import collections
+import contextvars
 import itertools
 import json
 import re
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib import import_module
 
@@ -16,7 +18,7 @@ from django.utils.safestring import mark_safe
 from django.utils.text import capfirst
 
 from wagtail.admin.staticfiles import versioned_static
-from wagtail.admin.telepath import JSContext
+from wagtail.admin.telepath import Adapter, JSContext
 from wagtail.admin.telepath import register as register_telepath_adapter
 from wagtail.utils.templates import template_is_overridden
 
@@ -27,6 +29,7 @@ __all__ = [
     "DeclarativeSubBlocksMetaclass",
     "BlockWidget",
     "BlockField",
+    "LazyBlock",
 ]
 
 
@@ -573,6 +576,39 @@ class Block(metaclass=BaseBlock):
         # deconstruct
         return self.deconstruct()
 
+    @classmethod
+    def coerce(cls, value):
+        """
+        Normalize a child-block specification into a ``Block`` instance.
+
+        A ``Block`` instance is used as-is and a ``Block`` subclass is
+        instantiated — the long-standing shorthands. A *reference* — a callable
+        returning a block class (e.g. ``lambda: MyBlock``) or a dotted import
+        path string (e.g. ``"myapp.blocks.MyBlock"``) — is wrapped in the
+        internal lazy mechanism so it is resolved on demand; this is how forward
+        and cyclic references are expressed without the caller touching that
+        mechanism directly. Subclasses may override this to customise how they
+        interpret child specifications.
+        """
+        if isinstance(value, Block):
+            return value
+        if isinstance(value, type):
+            if not issubclass(value, Block):
+                raise TypeError(
+                    "Expected a Block subclass, got non-Block class %r." % (value,)
+                )
+            return value()
+        if isinstance(value, str) or callable(value):
+            return LazyBlock(value)
+        raise TypeError(
+            "Expected a Block instance, a Block subclass, or a block reference "
+            "(a callable returning a block, or a dotted import path); got %r."
+            % (value,)
+        )
+
+    def has_deferred_reference(self):
+        return False
+
     def __eq__(self, other):
         """
         Implement equality on block objects so that two blocks with matching definitions are considered
@@ -584,6 +620,12 @@ class Block(metaclass=BaseBlock):
         any more, but has been retained as it provides a sensible definition of equality (and there's no
         reason to break it).
         """
+
+        if self is other:
+            # Identity short-circuit; the structural comparison below would
+            # recurse forever on a cyclic block graph (e.g. a block that
+            # resolves back to an enclosing block).
+            return True
 
         if not isinstance(other, Block):
             # if the other object isn't a block at all, it clearly isn't equal.
@@ -694,6 +736,308 @@ class DeclarativeSubBlocksMetaclass(BaseBlock):
         new_class.base_blocks = base_blocks
 
         return new_class
+
+
+# The chain of LazyBlock references currently being walked by a definition-graph
+# traversal (check / defer / restore). A reference that resolves back to one
+# already in the chain has closed a cycle, so the walk stops there. This lives
+# in a ContextVar rather than as instance / class state on LazyBlock, because
+# that would leak one traversal into another and recreate the class-attribute
+# problem that broke cyclic lookups.
+_active_lazyblock_walk = contextvars.ContextVar("wagtail_lazyblock_walk", default=())
+
+
+class LazyBlock(Block):
+    """
+    A reference to another block definition that is resolved on demand. It lets
+    a block graph contain cycles that Python's class definition order would
+    otherwise forbid, such as a block that contains a list of itself::
+
+        class CommentBlock(StructBlock):
+            text = RichTextBlock()
+            replies = ListBlock(lambda: CommentBlock)
+
+    Container blocks (``ListBlock``, ``StreamBlock``, ``StructBlock``,
+    ``TypedTableBlock``) accept a ``LazyBlock`` wherever a child block is
+    expected, and also accept a callable (e.g. ``lambda: MyBlock``) or a dotted
+    import path string (e.g. ``"myapp.blocks.MyBlock"``) which they wrap in a
+    ``LazyBlock`` automatically via :meth:`Block.coerce`.
+
+    The ``target`` may be:
+
+    * a callable returning a block class, for example ``lambda: CommentBlock``.
+    * a dotted import path, for example ``"myapp.blocks.AccordionBlock"``.
+    * a block class directly.
+
+    Any further positional and keyword arguments are passed to the target's
+    constructor when it is resolved (so ``LazyBlock(lambda: MyBlock, required=False)``
+    works), and they form part of the reference's identity when detecting cycles.
+
+    All cycle handling lives on this class. The definition-graph traversals
+    (``check``, ``defer_required_validation``, ``restore_deferred_validation``)
+    are guarded so that a cycle is broken in a single place; value methods
+    delegate to the resolved target.
+
+    A cycle must pass through a block that holds zero or more child items added
+    on demand (``ListBlock``, ``StreamBlock``, ``TypedTableBlock``). Routing a
+    cycle only through always-rendered blocks (such as ``StructBlock`` referring
+    back to itself) is **not supported**: the editor cannot render it (it would
+    expand without end) and building a default recurses without limit. This is a
+    documented constraint, not a validated one — such a definition will fail at
+    runtime rather than with a tidy error.
+    """
+
+    def __init__(self, target, *args, **kwargs):
+        # The standard Block setup (meta, creation counter, registry, …) with no
+        # meta options: **kwargs are for the target constructor, not Block meta, so
+        # they are deliberately not forwarded to super().__init__().
+        super().__init__()
+        self.target = target
+        self.target_args = args
+        self.target_kwargs = kwargs
+        self.resolved_block = None
+        # Set by construct_from_lookup for index-based migration reconstruction.
+        # When set, resolve() fetches the block from the lookup table instead of
+        # instantiating get_target_class().
+        self.lazy_lookup = None
+        self.lazy_lookup_index = None
+
+    def resolve(self):
+        """Return the target block instance, instantiating it once and caching it."""
+        if self.resolved_block is None:
+            if self.lazy_lookup is not None:
+                self.resolved_block = self.lazy_lookup.get_block(self.lazy_lookup_index)
+            else:
+                self.resolved_block = self._build_target()
+            if self.name:
+                self.resolved_block.set_name(self.name)
+        return self.resolved_block
+
+    def _build_target(self):
+        """Instantiate the target block for an ordinary (non-lookup) reference."""
+        target = self.target
+        if isinstance(target, str):
+            module_name, class_name = target.rsplit(".", 1)
+            target = getattr(import_module(module_name), class_name)
+        if isinstance(target, type):
+            return target(*self.target_args, **self.target_kwargs)
+        if callable(target):
+            result = target()
+            # A callable returning a ready-made block instance is used as-is, so its
+            # own constructor arguments are preserved; only a returned class is
+            # instantiated with this LazyBlock's extra args.
+            if isinstance(result, Block):
+                return result
+            if isinstance(result, type):
+                return result(*self.target_args, **self.target_kwargs)
+        raise ImproperlyConfigured(
+            "LazyBlock target must be a dotted import path, a block class, or a "
+            "callable returning one; got %r." % (self.target,)
+        )
+
+    def get_target_class(self):
+        """Resolve ``self.target`` to a block class without instantiating it."""
+        if self.lazy_lookup is not None:
+            # Reconstructed from a lookup table: the placeholder callable is never the
+            # real target, so derive the class from the block fetched from the lookup.
+            return type(self.resolve())
+        target = self.target
+        if isinstance(target, str):
+            module_name, class_name = target.rsplit(".", 1)
+            return getattr(import_module(module_name), class_name)
+        if isinstance(target, type):
+            return target
+        if callable(target):
+            result = target()
+            return result if isinstance(result, type) else type(result)
+        raise ImproperlyConfigured(
+            "LazyBlock target must be a dotted import path, a block class, or a "
+            "callable returning one; got %r." % (target,)
+        )
+
+    @property
+    def cycle_key(self):
+        """
+        Return the identity used for cycle detection and lookup serialization.
+
+        Blocks reconstructed from a lookup must key off the lookup object and
+        index they came from, so they round-trip back to that same definition.
+        Ordinary lazy references key off the resolved target class and the
+        constructor arguments that define the reference.
+        """
+        if self.lazy_lookup_index is not None:
+            # Identity for a reference reconstructed from a lookup table: the lookup
+            # object plus the index it was read from, so it round-trips back to the
+            # same definition. Compared only for equality, never hashed; the lookup
+            # object has no __eq__ so it compares by identity.
+            return (
+                self.lazy_lookup,
+                self.lazy_lookup_index,
+                self.target_args,
+                self.target_kwargs,
+            )
+
+        target_class = self.get_target_class()
+        path = "%s.%s" % (target_class.__module__, target_class.__qualname__)
+        return (path, self.target_args, self.target_kwargs)
+
+    @contextmanager
+    def walking(self):
+        """
+        Guard for definition-graph traversals.
+
+        Yield ``False`` when this traversal has come back to the same lazy
+        reference, so the caller can stop at the cycle edge. Otherwise yield
+        ``True`` and add this reference to the active walk for the duration of
+        the context manager.
+        """
+        key = self.cycle_key
+        if any(active == key for active in _active_lazyblock_walk.get()):
+            yield False
+            return
+
+        token = _active_lazyblock_walk.set(_active_lazyblock_walk.get() + (key,))
+        try:
+            yield True
+        finally:
+            _active_lazyblock_walk.reset(token)
+
+    def check(self, **kwargs):
+        errors = []
+        with self.walking() as entered:
+            if not entered:
+                return errors
+            errors.extend(self.resolve().check(**kwargs))
+        return errors
+
+    def defer_required_validation(self):
+        with self.walking() as entered:
+            if entered:
+                self.resolve().defer_required_validation()
+
+    def restore_deferred_validation(self):
+        with self.walking() as entered:
+            if entered:
+                self.resolve().restore_deferred_validation()
+
+    def has_deferred_reference(self):
+        return True
+
+    def deconstruct(self):
+        # Serialize the reference itself as a dotted path. Index-based references
+        # are only for lookup-aware deconstruction.
+        target_class = self.get_target_class()
+        path = self.canonical_module_path
+        args = (
+            "%s.%s" % (target_class.__module__, target_class.__qualname__),
+            *self.target_args,
+        )
+        kwargs = self.target_kwargs
+        return (path, args, kwargs)
+
+    def deconstruct_with_lookup(self, lookup):
+        path = self.canonical_module_path
+        # Reserve by explicit identity so a cyclic graph can point back to the
+        # same in-progress definition, while ordinary blocks still deduplicate
+        # structurally in the lookup builder.
+        index = lookup.add_block(self.resolve(), identity=self.cycle_key)
+        args = [index, *self.target_args]
+        kwargs = self.target_kwargs
+        return (path, args, kwargs)
+
+    @classmethod
+    def construct_from_lookup(cls, lookup, index, *target_args, **target_kwargs):
+        # The placeholder target is never called. Once lookup/index are set,
+        # resolve() reconstructs the target block from the lookup table instead.
+        lazy = cls(lambda: None, *target_args, **target_kwargs)
+        lazy.lazy_lookup = lookup
+        lazy.lazy_lookup_index = index
+        return lazy
+
+    def to_python(self, *args, **kwargs):
+        return self.resolve().to_python(*args, **kwargs)
+
+    def bulk_to_python(self, values):
+        # Short-circuit the empty case so we don't resolve the target at all: for a
+        # self-referential reference, resolving on every empty call would recurse
+        # forever. With data, delegate as normal.
+        if not values:
+            return []
+        return self.resolve().bulk_to_python(values)
+
+    def value_from_datadict(self, *args, **kwargs):
+        return self.resolve().value_from_datadict(*args, **kwargs)
+
+    def value_omitted_from_data(self, *args, **kwargs):
+        return self.resolve().value_omitted_from_data(*args, **kwargs)
+
+    def bind(self, *args, **kwargs):
+        return self.resolve().bind(*args, **kwargs)
+
+    def clean(self, *args, **kwargs):
+        return self.resolve().clean(*args, **kwargs)
+
+    def clean_deferred(self, *args, **kwargs):
+        return self.resolve().clean_deferred(*args, **kwargs)
+
+    def normalize(self, *args, **kwargs):
+        return self.resolve().normalize(*args, **kwargs)
+
+    def get_default(self, *args, **kwargs):
+        return self.resolve().get_default(*args, **kwargs)
+
+    def get_prep_value(self, *args, **kwargs):
+        return self.resolve().get_prep_value(*args, **kwargs)
+
+    def get_api_representation(self, *args, **kwargs):
+        return self.resolve().get_api_representation(*args, **kwargs)
+
+    def get_form_state(self, *args, **kwargs):
+        return self.resolve().get_form_state(*args, **kwargs)
+
+    def get_context(self, *args, **kwargs):
+        return self.resolve().get_context(*args, **kwargs)
+
+    def get_template(self, *args, **kwargs):
+        return self.resolve().get_template(*args, **kwargs)
+
+    def render(self, *args, **kwargs):
+        return self.resolve().render(*args, **kwargs)
+
+    def render_basic(self, *args, **kwargs):
+        return self.resolve().render_basic(*args, **kwargs)
+
+    def get_searchable_content(self, *args, **kwargs):
+        return self.resolve().get_searchable_content(*args, **kwargs)
+
+    def extract_references(self, *args, **kwargs):
+        return self.resolve().extract_references(*args, **kwargs)
+
+    def get_block_by_content_path(self, *args, **kwargs):
+        return self.resolve().get_block_by_content_path(*args, **kwargs)
+
+    def get_description(self, *args, **kwargs):
+        return self.resolve().get_description(*args, **kwargs)
+
+    def get_preview_template(self, *args, **kwargs):
+        return self.resolve().get_preview_template(*args, **kwargs)
+
+    def get_preview_context(self, *args, **kwargs):
+        return self.resolve().get_preview_context(*args, **kwargs)
+
+    def get_preview_value(self, *args, **kwargs):
+        return self.resolve().get_preview_value(*args, **kwargs)
+
+    def id_for_label(self, *args, **kwargs):
+        return self.resolve().id_for_label(*args, **kwargs)
+
+
+class LazyBlockAdapter(Adapter):
+    def build_node(self, obj, context):
+        return context.build_node(obj.resolve())
+
+
+register_telepath_adapter(LazyBlockAdapter(), LazyBlock)
 
 
 # ========================
@@ -855,4 +1199,5 @@ def get_error_list_json_data(error_list):
 
 DECONSTRUCT_ALIASES = {
     Block: "wagtail.blocks.Block",
+    LazyBlock: "wagtail.blocks.LazyBlock",
 }

@@ -141,22 +141,29 @@ class ListBlock(Block):
     def __init__(self, child_block, search_index=True, **kwargs):
         super().__init__(**kwargs)
         self.search_index = search_index
-        if isinstance(child_block, type):
-            # child_block was passed as a class, so convert it to a block instance
-            self.child_block = child_block()
-        else:
-            self.child_block = child_block
+        self.child_block = self.coerce(child_block)
 
         self._has_default = hasattr(self.meta, "default")
         if not self._has_default:
-            # Default to a list consisting of one empty (i.e. default-valued) child item
-            self.meta.default = [self.child_block.get_default()]
+            if self.child_block.has_deferred_reference():
+                # Seeding [child.get_default()] would resolve the deferred reference at
+                # construction time, which for a self-reference is impossible (the class
+                # is not defined yet) or endlessly recursive (each default item holds
+                # another). [] is the only finite default; has_deferred_reference()
+                # decides this without resolving.
+                self.meta.default = []
+            else:
+                # Default to a list consisting of one empty (i.e. default-valued) child item
+                self.meta.default = [self.child_block.get_default()]
 
     # If a subclass of ListBlock overrides __init__, we cannot assume that the first argument is
     # the child block, and thus we cannot rely on the conversion applied in construct_from_lookup /
     # deconstruct_with_lookup to be valid. We set a flag attribute on the __init__ method so that
     # we can spot this case.
     __init__.has_child_block_arg = True
+
+    def has_deferred_reference(self):
+        return self.child_block.has_deferred_reference()
 
     @classmethod
     def construct_from_lookup(cls, lookup, *args, **kwargs):

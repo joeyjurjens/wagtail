@@ -2636,6 +2636,28 @@ class TestInlineStreamField(WagtailTestUtils, TestCase):
         self.assertTrue(blockDiv.has_attr("data-w-block-data-value"))
 
 
+class TestCyclicStreamField(WagtailTestUtils, TestCase):
+    """Test that a page edit form containing cyclic StreamField blocks renders correctly."""
+
+    def test_cyclic_streamfield_edit_form_renders(self):
+        homepage = Page.objects.get(id=2)
+        self.login()
+
+        response = self.client.get(
+            reverse(
+                "wagtailadmin_pages:add",
+                args=("tests", "streampage", homepage.id),
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+
+        soup = self.get_soup(response.content)
+        block_div = soup.find("div", {"data-controller": "w-block"})
+        self.assertIsNotNone(block_div)
+        self.assertTrue(block_div.has_attr("data-w-block-arguments-value"))
+        self.assertTrue(block_div.has_attr("data-w-block-data-value"))
+
+
 class TestIssue2994(WagtailTestUtils, TestCase):
     """
     In contrast to most "standard" form fields, StreamField form widgets generally won't

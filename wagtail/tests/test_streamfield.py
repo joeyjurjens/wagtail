@@ -1201,6 +1201,80 @@ class TestDeconstructStreamFieldWithLookup(TestCase):
             },
         )
 
+    def test_deconstruct_with_cyclic_block(self):
+        # AccordionBlock ↔ ContentStreamBlock is a mutual reference. It deconstructs to
+        # a finite lookup that round-trips: the LazyBlock's child index points back to
+        # an enclosing definition, closing the cycle instead of expanding forever.
+        class AccordionBlock(blocks.StructBlock):
+            heading = blocks.CharBlock()
+            content = blocks.LazyBlock(lambda: ContentStreamBlock)
+
+        class ContentStreamBlock(blocks.StreamBlock):
+            accordion = AccordionBlock()
+            paragraph = blocks.RichTextBlock()
+
+        field = StreamField([("accordion", AccordionBlock())], blank=True)
+        field.set_attributes_from_name("body")
+        name, path, args, kwargs = field.deconstruct()
+        self.assertEqual(name, "body")
+        self.assertEqual(path, "wagtail.fields.StreamField")
+        self.assertEqual(args, [[("accordion", 3)]])
+        self.assertEqual(
+            kwargs,
+            {
+                "blank": True,
+                "block_lookup": {
+                    0: ("wagtail.blocks.CharBlock", (), {}),
+                    1: (
+                        "wagtail.blocks.StreamBlock",
+                        [[("accordion", 3), ("paragraph", 4)]],
+                        {},
+                    ),
+                    2: ("wagtail.blocks.LazyBlock", [1], {}),
+                    3: (
+                        "wagtail.blocks.StructBlock",
+                        [[("heading", 0), ("content", 2)]],
+                        {},
+                    ),
+                    4: ("wagtail.blocks.RichTextBlock", (), {}),
+                },
+            },
+        )
+
+    def test_deconstruct_with_self_referential_block(self):
+        # A block that contains a ListBlock of itself via LazyBlock(lambda: ...). It
+        # deconstructs to a finite lookup that round-trips: the LazyBlock's child index
+        # points back to the enclosing definition, closing the cycle.
+        class CommentBlock(blocks.StructBlock):
+            text = blocks.CharBlock()
+            replies = blocks.ListBlock(blocks.LazyBlock(lambda: CommentBlock))
+
+        field = StreamField([("comment", CommentBlock())], blank=True)
+        field.set_attributes_from_name("body")
+        name, path, args, kwargs = field.deconstruct()
+        self.assertEqual(name, "body")
+        self.assertEqual(path, "wagtail.fields.StreamField")
+        # The top-level `comment` block is structurally identical to the LazyBlock's
+        # resolved target, so it deduplicates onto the same slot (1) rather than
+        # producing a redundant duplicate entry.
+        self.assertEqual(args, [[("comment", 1)]])
+        self.assertEqual(
+            kwargs,
+            {
+                "blank": True,
+                "block_lookup": {
+                    0: ("wagtail.blocks.CharBlock", (), {}),
+                    1: (
+                        "wagtail.blocks.StructBlock",
+                        [[("text", 0), ("replies", 3)]],
+                        {},
+                    ),
+                    2: ("wagtail.blocks.LazyBlock", [1], {}),
+                    3: ("wagtail.blocks.ListBlock", (2,), {}),
+                },
+            },
+        )
+
 
 class TestBlockTypeValidation(TestCase):
     def test_non_streamblock_raises_correct_error(self):

@@ -8,7 +8,7 @@ from decimal import Decimal
 
 # non-standard import name for gettext_lazy, to prevent strings from being picked up for translation
 from django import forms
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.forms.utils import ErrorList
 from django.template.loader import render_to_string
@@ -17,9 +17,12 @@ from django.utils.safestring import SafeData, mark_safe
 from django.utils.translation import gettext_lazy as _
 
 from wagtail import blocks
-from wagtail.admin.telepath import registry
+from wagtail.admin.telepath import JSContext, registry
 from wagtail.blocks.base import get_error_json_data
-from wagtail.blocks.definition_lookup import BlockDefinitionLookup
+from wagtail.blocks.definition_lookup import (
+    BlockDefinitionLookup,
+    BlockDefinitionLookupBuilder,
+)
 from wagtail.blocks.field_block import FieldBlockAdapter
 from wagtail.blocks.list_block import ListBlockAdapter, ListBlockValidationError
 from wagtail.blocks.static_block import StaticBlockAdapter
@@ -29,10 +32,11 @@ from wagtail.blocks.struct_block import (
     StructBlockAdapter,
     StructBlockValidationError,
 )
+from wagtail.contrib.typed_table_block.blocks import TypedTableBlock
 from wagtail.models import Page
 from wagtail.rich_text import RichText
+from wagtail.test.testapp.blocks import AccordionBlock, ContentStreamBlock, SectionBlock
 from wagtail.test.testapp.blocks import LinkBlock as CustomLinkBlock
-from wagtail.test.testapp.blocks import SectionBlock
 from wagtail.test.testapp.models import EventPage, SimplePage
 from wagtail.test.utils import WagtailTestUtils
 
@@ -3058,6 +3062,35 @@ class TestStructBlock(SimpleTestCase):
         value = block.to_python({"title": "", "link": "https://example.com"})
         with self.assertRaises(ValidationError):
             block.clean(value)
+
+    def test_clean_deferred_restores_when_child_block_type_appears_multiple_times(self):
+        # Block instances declared in a class body are stored in base_blocks and
+        # shared across all instances of that class via a shallow copy. When the
+        # same StructBlock subclass is used more than once in a parent, all those
+        # uses share the same underlying FieldBlock instances. Without idempotent
+        # defer/restore in FieldBlock, the second visit in a single pass would
+        # overwrite _original_required with the already-modified value (False),
+        # permanently disabling required validation after restore.
+        class AddressBlock(blocks.StructBlock):
+            street = blocks.CharBlock()
+
+        block = blocks.StructBlock(
+            [
+                ("home", AddressBlock()),
+                ("work", AddressBlock()),
+            ]
+        )
+
+        value = block.to_python({"home": {"street": ""}, "work": {"street": ""}})
+        clean_value = block.clean_deferred(value)
+        self.assertEqual(clean_value["home"]["street"], "")
+        self.assertEqual(clean_value["work"]["street"], "")
+
+        # Required validation must be restored for both children after clean_deferred.
+        with self.assertRaises(ValidationError):
+            block.clean(
+                block.to_python({"home": {"street": ""}, "work": {"street": "Main St"}})
+            )
 
     def test_non_block_validation_error(self):
         class LinkBlock(blocks.StructBlock):
@@ -7128,3 +7161,444 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertIsInstance(list_block, blocks.ListBlock)
         list_item_block = list_block.child_block
         self.assertIsInstance(list_item_block, blocks.CharBlock)
+
+    def test_builder_deduplicates_identical_non_cyclic_blocks(self):
+        builder = BlockDefinitionLookupBuilder()
+        index = builder.add_block(
+            blocks.StructBlock(
+                [
+                    ("heading", blocks.CharBlock(required=True)),
+                    ("body", blocks.CharBlock(required=True)),
+                ]
+            )
+        )
+        lookup_dict = builder.get_lookup_as_dict()
+        char_entries = [
+            entry
+            for entry in lookup_dict.values()
+            if entry == ("wagtail.blocks.CharBlock", (), {"required": True})
+        ]
+
+        self.assertIn(index, lookup_dict)
+        self.assertEqual(
+            char_entries,
+            [("wagtail.blocks.CharBlock", (), {"required": True})],
+        )
+        self.assertEqual(len(lookup_dict), 2)
+
+
+class TestLazyBlock(SimpleTestCase):
+    def setUp(self):
+        class CommentBlock(blocks.StructBlock):
+            text = blocks.CharBlock()
+            replies = blocks.ListBlock(blocks.LazyBlock(lambda: CommentBlock))
+
+        self.CommentBlock = CommentBlock
+
+    def test_child_is_lazyblock_resolving_to_owner(self):
+        block = self.CommentBlock()
+        replies = block.child_blocks["replies"]
+        self.assertIsInstance(replies, blocks.ListBlock)
+        self.assertIsInstance(replies.child_block, blocks.LazyBlock)
+        self.assertIsInstance(replies.child_block.resolve(), self.CommentBlock)
+
+    def test_streamblock_self_reference(self):
+        class TreeBlock(blocks.StreamBlock):
+            node = blocks.LazyBlock(lambda: TreeBlock)
+
+        block = TreeBlock()
+        self.assertIsInstance(block.child_blocks["node"], blocks.LazyBlock)
+        self.assertIsInstance(block.child_blocks["node"].resolve(), TreeBlock)
+        self.assertEqual(block.check(), [])
+
+    def test_inherited_reference_resolves_to_referenced_class(self):
+        class SubComment(self.CommentBlock):
+            pass
+
+        # The reference is a shared callable pointing at CommentBlock, so it
+        # still resolves to CommentBlock on the subclass.
+        resolved = SubComment().child_blocks["replies"].child_block.resolve()
+        self.assertIsInstance(resolved, self.CommentBlock)
+
+    def test_invalid_target_raises_on_resolve(self):
+        lazy = blocks.LazyBlock(42)
+        with self.assertRaises(ImproperlyConfigured):
+            lazy.resolve()
+
+    def test_callable_returning_instance_preserves_its_constructor_args(self):
+        # A callable that returns a ready-made block instance is used as-is, so the
+        # instance's own constructor arguments survive (they are not dropped by
+        # re-instantiating the class).
+        lazy = blocks.LazyBlock(lambda: blocks.CharBlock(required=False))
+        resolved = lazy.resolve()
+        self.assertIsInstance(resolved, blocks.CharBlock)
+        self.assertFalse(resolved.required)
+
+    def test_coerce_rejects_non_block_class(self):
+        # coerce() instantiates Block subclasses but rejects an unrelated class with
+        # a clear TypeError instead of silently constructing a non-Block child.
+        class NotABlock:
+            pass
+
+        with self.assertRaises(TypeError):
+            blocks.ListBlock(NotABlock)
+
+    def test_containers_coerce_bare_reference_into_lazyblock(self):
+        # The public API: a bare callable or dotted-path string given to a container is
+        # automatically wrapped in a LazyBlock (no explicit LazyBlock(...) needed). This
+        # holds across the different container kinds.
+        list_block = blocks.ListBlock(lambda: blocks.CharBlock)
+        self.assertIsInstance(list_block.child_block, blocks.LazyBlock)
+        self.assertIsInstance(list_block.child_block.resolve(), blocks.CharBlock)
+
+        stream_block = blocks.StreamBlock([("para", "wagtail.blocks.RichTextBlock")])
+        self.assertIsInstance(stream_block.child_blocks["para"], blocks.LazyBlock)
+        self.assertIsInstance(
+            stream_block.child_blocks["para"].resolve(), blocks.RichTextBlock
+        )
+
+        struct_block = blocks.StructBlock([("title", lambda: blocks.CharBlock)])
+        self.assertIsInstance(struct_block.child_blocks["title"], blocks.LazyBlock)
+        self.assertIsInstance(
+            struct_block.child_blocks["title"].resolve(), blocks.CharBlock
+        )
+
+    def test_dotted_path_resolves_across_classes(self):
+        content = AccordionBlock().child_blocks["content"]
+        self.assertIsInstance(content, blocks.LazyBlock)
+        stream = content.resolve()
+        self.assertIsInstance(stream, ContentStreamBlock)
+        self.assertIsInstance(stream.child_blocks["accordion"], AccordionBlock)
+
+    def test_callable_target_resolves(self):
+        target_class = blocks.CharBlock
+        lazy = blocks.LazyBlock(lambda: target_class)
+        self.assertIsInstance(lazy.resolve(), blocks.CharBlock)
+
+    def test_class_target_resolves(self):
+        lazy = blocks.LazyBlock(blocks.CharBlock)
+        self.assertIsInstance(lazy.resolve(), blocks.CharBlock)
+
+    def test_callable_target_enables_forward_reference(self):
+        # A callable allows referencing a class that doesn't exist yet at
+        # definition time, equivalent to a dotted path for module-level classes.
+        class AccordionBlock(blocks.StructBlock):
+            heading = blocks.CharBlock()
+            content = blocks.LazyBlock(lambda: ContentStreamBlock)
+
+        class ContentStreamBlock(blocks.StreamBlock):
+            accordion = AccordionBlock()
+            paragraph = blocks.RichTextBlock()
+
+        resolved = AccordionBlock().child_blocks["content"].resolve()
+        self.assertIsInstance(resolved, ContentStreamBlock)
+
+    def test_args_passed_to_resolved_target(self):
+        class NumberedListBlock(blocks.StructBlock):
+            title = blocks.CharBlock()
+            children = blocks.ListBlock(
+                blocks.LazyBlock(lambda: NumberedListBlock, min_num=2)
+            )
+
+        resolved = NumberedListBlock().child_blocks["children"].child_block.resolve()
+        self.assertIsInstance(resolved, NumberedListBlock)
+        # the min_num kwarg passed to LazyBlock is applied to the resolved target
+        self.assertEqual(resolved.meta.min_num, 2)
+
+    def test_get_default_terminates_with_empty_list(self):
+        default = self.CommentBlock().get_default()
+        self.assertIn("text", default)
+        self.assertEqual(list(default["replies"]), [])
+
+    def test_get_default_terminates_for_mutual_reference(self):
+        default = AccordionBlock().get_default()
+        self.assertIn("heading", default)
+        self.assertEqual(list(default["content"]), [])
+
+    def test_get_default_terminates_through_list_of_struct(self):
+        class OrgBlock(blocks.StructBlock):
+            title = blocks.CharBlock()
+            reports = blocks.ListBlock(
+                blocks.StructBlock([("person", blocks.LazyBlock(lambda: OrgBlock))])
+            )
+
+        self.assertEqual(list(OrgBlock().get_default()["reports"]), [])
+
+    def test_to_python_handles_nested_value(self):
+        value = self.CommentBlock().to_python(
+            {
+                "text": "root",
+                "replies": [
+                    {
+                        "type": "item",
+                        "value": {"text": "child", "replies": []},
+                        "id": "1",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(value["text"], "root")
+        self.assertEqual(len(value["replies"]), 1)
+        self.assertEqual(value["replies"][0]["text"], "child")
+
+    def test_bulk_to_python_empty_does_not_resolve(self):
+        # The empty case short-circuits to [] without resolving the target, so an empty
+        # self-referential list does not recurse forever.
+        resolved = []
+
+        def target():
+            resolved.append(True)
+            return blocks.CharBlock
+
+        lazy = blocks.LazyBlock(target)
+        self.assertEqual(lazy.bulk_to_python([]), [])
+        self.assertEqual(resolved, [])  # target was never resolved
+
+    def test_bulk_to_python_with_values_delegates_to_target(self):
+        lazy = blocks.LazyBlock("wagtail.blocks.CharBlock")
+        self.assertEqual(
+            lazy.bulk_to_python(["a", "b"]),
+            blocks.CharBlock().bulk_to_python(["a", "b"]),
+        )
+
+    def test_value_methods_call_resolved_block(self):
+        # Every plainly-delegated value/rendering method calls the corresponding method
+        # on the resolved target with the same arguments. If any of these were missing
+        # or called the wrong method, the spy below would not be invoked. (bulk_to_python
+        # is excluded: it has its own empty-case logic, tested separately.)
+        lazy = blocks.LazyBlock("wagtail.blocks.CharBlock")
+        target = lazy.resolve()
+        delegated_methods = [
+            "value_from_datadict",
+            "value_omitted_from_data",
+            "bind",
+            "clean",
+            "clean_deferred",
+            "normalize",
+            "to_python",
+            "get_default",
+            "get_form_state",
+            "get_prep_value",
+            "get_api_representation",
+            "get_context",
+            "render",
+            "render_basic",
+            "get_template",
+            "get_searchable_content",
+            "extract_references",
+            "get_block_by_content_path",
+            "get_description",
+            "get_preview_template",
+            "get_preview_context",
+            "get_preview_value",
+            "id_for_label",
+        ]
+        for name in delegated_methods:
+            with self.subTest(method=name):
+                return_value = object()
+                with unittest.mock.patch.object(
+                    target, name, return_value=return_value
+                ) as spy:
+                    result = getattr(lazy, name)("first-arg", "second-arg")
+                self.assertIs(result, return_value)
+                spy.assert_called_once_with("first-arg", "second-arg")
+
+    def test_set_name_names_the_reference_without_resolving(self):
+        # Naming a child must not force the reference to resolve its target — that would
+        # defeat laziness / forward references. The name is set on the reference itself,
+        # and only propagated to the target later, when it is resolved.
+        lazy = blocks.LazyBlock("wagtail.blocks.CharBlock")
+        lazy.set_name("my_field")
+        self.assertEqual(lazy.name, "my_field")
+        self.assertIsNone(lazy.resolved_block)  # set_name did not resolve the target
+
+        resolved = lazy.resolve()
+        self.assertEqual(resolved.name, "my_field")  # propagated on resolve
+
+    def test_clean_deferred_defers_required_validation(self):
+        # clean_deferred defers required-field validation across the whole graph
+        # (so an empty required field is allowed) and restores it afterwards -
+        # and it terminates on the recursive block.
+        block = self.CommentBlock()
+        value = block.to_python({"text": "", "replies": []})
+
+        cleaned = block.clean_deferred(value)
+        self.assertEqual(cleaned["text"], "")
+
+        # Required validation is restored after clean_deferred.
+        with self.assertRaises(ValidationError):
+            block.clean(value)
+
+    def test_equality_does_not_recurse(self):
+        # Two distinct instances of a self-referential block compare equal without
+        # recursing forever over the cyclic definition graph.
+        self.assertEqual(self.CommentBlock(), self.CommentBlock())
+
+    def test_check_terminates_without_errors(self):
+        self.assertEqual(self.CommentBlock().check(), [])
+        self.assertEqual(AccordionBlock().check(), [])
+
+    def test_self_reference_deconstructs_to_path(self):
+        lazy = self.CommentBlock().child_blocks["replies"].child_block
+        path, args, kwargs = lazy.deconstruct()
+        self.assertEqual(path, "wagtail.blocks.LazyBlock")
+        # the callable resolved to the referenced class's import path; no lookup index.
+        self.assertTrue(args[0].endswith("CommentBlock"))
+
+    def test_lookup_dict_uses_index_and_round_trips(self):
+        builder = BlockDefinitionLookupBuilder()
+        index = builder.add_block(AccordionBlock())
+        lookup_dict = builder.get_lookup_as_dict()
+
+        # The LazyBlock entry references its target by integer index into the
+        # lookup table, not by a path string.
+        lazy_entries = [
+            entry
+            for entry in lookup_dict.values()
+            if entry[0] == "wagtail.blocks.LazyBlock"
+        ]
+        self.assertEqual(len(lazy_entries), 1)
+        self.assertIsInstance(lazy_entries[0][1][0], int)
+
+        restored = BlockDefinitionLookup(lookup_dict).get_block(index)
+        self.assertEqual(restored.check(), [])
+        content = restored.child_blocks["content"]
+        self.assertIsInstance(content, blocks.LazyBlock)
+        # StructBlock/StreamBlock subclasses deconstruct to their base class by
+        # design, so the resolved block is a StreamBlock, not ContentStreamBlock.
+        resolved = content.resolve()
+        self.assertIsInstance(resolved, blocks.StreamBlock)
+        self.assertIn("accordion", resolved.child_blocks)
+        self.assertIn("paragraph", resolved.child_blocks)
+
+    def test_self_referential_lookup_round_trips(self):
+        builder = BlockDefinitionLookupBuilder()
+        index = builder.add_block(self.CommentBlock())
+        lookup_dict = builder.get_lookup_as_dict()
+
+        # Under the lookup the LazyBlock entry references its target by integer index,
+        # which closes the self-reference back onto an existing slot.
+        lazy_entries = [
+            entry
+            for entry in lookup_dict.values()
+            if entry[0] == "wagtail.blocks.LazyBlock"
+        ]
+        self.assertEqual(len(lazy_entries), 1)
+        self.assertIsInstance(lazy_entries[0][1][0], int)
+
+        restored = BlockDefinitionLookup(lookup_dict).get_block(index)
+        self.assertEqual(restored.check(), [])
+        replies = restored.child_blocks["replies"]
+        self.assertIsInstance(replies, blocks.ListBlock)
+        inner_lazy = replies.child_block
+        self.assertIsInstance(inner_lazy, blocks.LazyBlock)
+        # StructBlock subclasses deconstruct to plain StructBlock by design.
+        self.assertIsInstance(inner_lazy.resolve(), blocks.StructBlock)
+        self.assertIn("text", inner_lazy.resolve().child_blocks)
+        self.assertIn("replies", inner_lazy.resolve().child_blocks)
+
+    def test_self_referential_lookup_round_trips_through_reserialization(self):
+        builder = BlockDefinitionLookupBuilder()
+        index = builder.add_block(self.CommentBlock())
+        restored = BlockDefinitionLookup(builder.get_lookup_as_dict()).get_block(index)
+
+        rebuilt = BlockDefinitionLookupBuilder()
+        rebuilt_index = rebuilt.add_block(restored)
+        rebuilt_lookup_dict = rebuilt.get_lookup_as_dict()
+
+        self.assertIn(rebuilt_index, rebuilt_lookup_dict)
+        lazy_entries = [
+            entry
+            for entry in rebuilt_lookup_dict.values()
+            if entry[0] == "wagtail.blocks.LazyBlock"
+        ]
+        self.assertEqual(len(lazy_entries), 1)
+        self.assertIsInstance(lazy_entries[0][1][0], int)
+
+    def test_target_kwargs_preserved_through_lookup_round_trip(self):
+        class NumberedListBlock(blocks.StructBlock):
+            title = blocks.CharBlock()
+            children = blocks.ListBlock(
+                blocks.LazyBlock(lambda: NumberedListBlock, min_num=2)
+            )
+
+        builder = BlockDefinitionLookupBuilder()
+        index = builder.add_block(NumberedListBlock())
+        lookup_dict = builder.get_lookup_as_dict()
+
+        # The target kwarg is carried on the LazyBlock entry, so it survives the round trip.
+        lazy_entries = [
+            entry
+            for entry in lookup_dict.values()
+            if entry[0] == "wagtail.blocks.LazyBlock"
+        ]
+        self.assertEqual(len(lazy_entries), 1)
+        self.assertEqual(lazy_entries[0][2], {"min_num": 2})
+
+        restored = BlockDefinitionLookup(lookup_dict).get_block(index)
+        self.assertEqual(restored.check(), [])
+        inner_lazy = restored.child_blocks["children"].child_block
+        self.assertIsInstance(inner_lazy, blocks.LazyBlock)
+        self.assertIsInstance(inner_lazy.resolve(), blocks.StructBlock)
+
+    def test_non_cyclic_pack_round_trip(self):
+        block = blocks.StructBlock(
+            [("heading", blocks.CharBlock()), ("body", blocks.CharBlock())]
+        )
+        block.set_name("section")
+        packed = JSContext().pack(block)
+        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
+
+    def test_self_referential_pack_terminates(self):
+        block = self.CommentBlock()
+        block.set_name("comment")
+        packed = JSContext().pack(block)
+        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
+
+    def test_mutual_reference_pack_terminates(self):
+        packed = JSContext().pack(AccordionBlock())
+        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
+
+    def test_clean_deferred_restores_on_mutual_reference(self):
+        # The idempotency fix for defer/restore must also hold for mutual
+        # references. AccordionBlock ↔ ContentStreamBlock shares heading's
+        # CharBlock instance across the graph; without the guard, _original_required
+        # would be corrupted and clean() would stop enforcing required fields.
+        block = AccordionBlock()
+        value = block.to_python({"heading": "", "content": []})
+
+        cleaned = block.clean_deferred(value)
+        self.assertEqual(cleaned["heading"], "")
+
+        with self.assertRaises(ValidationError):
+            block.clean(value)
+
+    def test_clean_validates_at_depth(self):
+        # Validation errors at any depth of the recursive structure must
+        # propagate through the LazyBlock indirection to the caller.
+        block = self.CommentBlock()
+        value = block.to_python(
+            {"text": "ok", "replies": [{"text": "", "replies": []}]}
+        )
+        with self.assertRaises(ValidationError):
+            block.clean(value)
+
+    def test_extract_references_terminates_with_nested_data(self):
+        # extract_references must terminate on a cyclic block with nested data,
+        # not recurse forever. CharBlock carries no page/snippet references.
+        block = self.CommentBlock()
+        value = block.to_python(
+            {"text": "top", "replies": [{"text": "reply", "replies": []}]}
+        )
+        refs = list(block.extract_references(value))
+        self.assertEqual(refs, [])
+
+    def test_typed_table_block_self_reference_terminates(self):
+        # A cycle through a TypedTableBlock is valid: it defaults to an empty
+        # table, so check() and get_default() terminate rather than recurse.
+        class RecursiveTableBlock(TypedTableBlock):
+            nested = blocks.LazyBlock(lambda: RecursiveTableBlock)
+
+        block = RecursiveTableBlock()
+        self.assertEqual(block.check(), [])
+        block.get_default()  # must terminate

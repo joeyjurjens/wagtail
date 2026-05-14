@@ -546,3 +546,25 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertTrue(text_block.required)
         country_block = struct_block.child_blocks["country"]
         self.assertIsInstance(country_block, blocks.ChoiceBlock)
+
+
+class TestCyclicTypedTableBlock(TestCase):
+    def test_cycle_through_typed_table_block_terminates(self):
+        # TypedTableBlock holds its cells on demand, so (like ListBlock / StreamBlock) it
+        # can brake a reference cycle: a fresh instance has no cells, so get_default and
+        # check terminate.
+        class TableContainer(blocks.StructBlock):
+            title = blocks.CharBlock()
+            table = TypedTableBlock(
+                [("nested", blocks.LazyBlock(lambda: TableContainer))]
+            )
+
+        container = TableContainer()
+        self.assertEqual(container.check(), [])
+        self.assertIn("table", container.get_default())
+
+    def test_typed_table_block_coerces_bare_reference(self):
+        # A bare callable / dotted path given to TypedTableBlock is wrapped as a LazyBlock.
+        block = TypedTableBlock([("cell", lambda: blocks.CharBlock)])
+        self.assertIsInstance(block.child_blocks["cell"], blocks.LazyBlock)
+        self.assertIsInstance(block.child_blocks["cell"].resolve(), blocks.CharBlock)

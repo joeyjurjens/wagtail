@@ -63,6 +63,11 @@ class FieldBlock(Block):
         return self.field.widget.value_omitted_from_data(data, files, prefix)
 
     def defer_required_validation(self):
+        # A shared FieldBlock instance (e.g. declared in a class body) can be reached
+        # via multiple paths; a second visit would overwrite _original_required with the
+        # already-modified value, permanently leaving field.required as False.
+        if self.is_deferred_validation:
+            return
         super().defer_required_validation()
         self._original_required = self.required
         self.field.required = False or getattr(self.meta, "required_on_save", False)
@@ -74,6 +79,11 @@ class FieldBlock(Block):
         return self.value_from_form(self.field.clean(self.value_for_form(value)))
 
     def restore_deferred_validation(self):
+        # Mirror the guard in defer_required_validation: a shared FieldBlock instance
+        # can be reached via multiple paths, so only restore on the first visit (when
+        # validation is still deferred) to avoid restoring stale state on a later one.
+        if not self.is_deferred_validation:
+            return
         self.field.required = self._original_required
         super().restore_deferred_validation()
 

@@ -63,10 +63,37 @@ class BlockDefinitionLookupBuilder:
         # and maintain a list of (index, deconstructed_tuple) pairs for each one.
         self.block_indexes_by_type = defaultdict(list)
 
-    def add_block(self, block):
+        # (identity, index) pairs for blocks added via an explicit `identity` key (see
+        # `add_block`). Kept separate from the structural dedup above because an identity
+        # is reserved *before* the block is deconstructed.
+        self.identity_pairs = []
+
+    def add_block(self, block, identity=None):
         """
-        Add a block to the lookup table, returning an index that can be used to refer to it
+        Add a block to the lookup table, returning an index that can be used to refer to it.
+
+        Pass ``identity`` to reserve the slot before ``deconstruct_with_lookup`` is
+        called, so that a back-reference encountered during deconstruction returns the
+        reserved index rather than recursing. Without an identity the original structural
+        dedup behaviour is used.
         """
+        if identity is not None:
+            for existing_identity, existing_index in self.identity_pairs:
+                if existing_identity == identity:
+                    return existing_index
+
+            # Reserve the slot before deconstructing so a back-reference encountered
+            # during deconstruction lands on this in-progress index instead of recursing.
+            index = len(self.blocks)
+            self.blocks.append(None)
+            self.identity_pairs.append((identity, index))
+            deconstructed = block.deconstruct_with_lookup(self)
+            self.blocks[index] = deconstructed
+            # Also register for structural dedup, so a later identical block reuses this
+            # slot rather than adding a duplicate.
+            self.block_indexes_by_type[deconstructed[0]].append((index, deconstructed))
+            return index
+
         deconstructed = block.deconstruct_with_lookup(self)
 
         # Check if we've already seen this block definition

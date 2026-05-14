@@ -1,4 +1,4 @@
-from wagtail.blocks import ListBlock, StreamBlock, StructBlock
+from wagtail.blocks import LazyBlock, ListBlock, StreamBlock, StructBlock
 
 
 class InvalidBlockDefError(Exception):
@@ -60,6 +60,9 @@ def map_block_value(block_value, block_def, block_path, operation, **kwargs):
     # problems here.
     if len(block_path) == 0:
         return operation.apply(block_value)
+
+    if isinstance(block_def, LazyBlock):
+        block_def = block_def.resolve()
 
     # Depending on whether the block is a ListBlock, StructBlock or StreamBlock we call a
     # different function to alter its children.

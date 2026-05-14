@@ -84,6 +84,7 @@ class BaseTypedTableBlock(Block):
         self.child_blocks = self.base_blocks.copy()
         if local_blocks:
             for name, block in local_blocks:
+                block = self.coerce(block)
                 block.set_name(name)
                 self.child_blocks[name] = block
 
@@ -94,6 +95,9 @@ class BaseTypedTableBlock(Block):
                 (name, lookup.get_block(index)) for name, index in child_blocks
             ]
         return cls(child_blocks, **kwargs)
+
+    def has_deferred_reference(self):
+        return any(b.has_deferred_reference() for b in self.child_blocks.values())
 
     def value_from_datadict(self, data, files, prefix):
         caption = data["%s-caption" % prefix]

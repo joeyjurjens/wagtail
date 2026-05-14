@@ -87,6 +87,7 @@ from wagtail.models import (
 from wagtail.search import index
 from wagtail.snippets.blocks import SnippetChooserBlock
 from wagtail.snippets.models import register_snippet
+from wagtail.test.testapp.blocks import AccordionBlock, CommentBlock
 
 from ...locks import WorkflowLock
 from .fields import CommentableJSONField
@@ -1816,6 +1817,8 @@ class StreamPage(Page):
                 ListBlock(CharBlock()),
             ),
             ("image_with_alt", ImageBlock()),
+            ("accordion", AccordionBlock()),
+            ("comment", CommentBlock()),
         ],
     )
 
