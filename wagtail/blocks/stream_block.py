@@ -19,6 +19,8 @@ from .base import (
     Block,
     BoundBlock,
     DeclarativeSubBlocksMetaclass,
+    _chooser_cache,
+    _collect_chooser_pks,
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
@@ -306,45 +308,64 @@ class BaseStreamBlock(Block):
         # 2) a 'block map' of each stream, telling us the type and id of each block and the index we
         #    need to look up in the corresponding child_outputs list to obtain its final value
 
-        child_inputs = defaultdict(list)
-        block_maps = []
+        # If we are the outermost bulk_to_python call (no cache active yet), collect all chooser
+        # PKs across the whole tree and resolve them in one query per model before proceeding.
+        token = None
+        if _chooser_cache.get() is None:
+            pks_by_model = {}
+            _collect_chooser_pks(self, values, pks_by_model)
+            if pks_by_model:
+                cache = {
+                    model: model.objects.in_bulk(pk_list)
+                    for model, pk_list in pks_by_model.items()
+                }
+                token = _chooser_cache.set(cache)
 
-        for stream in values:
-            block_map = []
-            for block_dict in stream:
-                block_type = block_dict["type"]
+        try:
+            child_inputs = defaultdict(list)
+            block_maps = []
 
-                if block_type not in self.child_blocks:
-                    # skip any blocks with an unrecognised type
-                    continue
+            for stream in values:
+                block_map = []
+                for block_dict in stream:
+                    block_type = block_dict["type"]
 
-                child_input_list = child_inputs[block_type]
-                child_index = len(child_input_list)
-                child_input_list.append(block_dict["value"])
-                block_map.append((block_type, block_dict.get("id"), child_index))
+                    if block_type not in self.child_blocks:
+                        # skip any blocks with an unrecognised type
+                        continue
 
-            block_maps.append(block_map)
+                    child_input_list = child_inputs[block_type]
+                    child_index = len(child_input_list)
+                    child_input_list.append(block_dict["value"])
+                    block_map.append((block_type, block_dict.get("id"), child_index))
 
-        # run each list in child_inputs through the relevant block's bulk_to_python
-        # to obtain child_outputs
-        child_outputs = {
-            block_type: self.child_blocks[block_type].bulk_to_python(child_input_list)
-            for block_type, child_input_list in child_inputs.items()
-        }
+                block_maps.append(block_map)
 
-        # for each stream, go through the block map, picking out the appropriately-indexed
-        # value from the relevant list in child_outputs
-        return [
-            StreamValue(
-                self,
-                [
-                    (block_type, child_outputs[block_type][child_index], id)
-                    for block_type, id, child_index in block_map
-                ],
-                is_lazy=False,
-            )
-            for block_map in block_maps
-        ]
+            # run each list in child_inputs through the relevant block's bulk_to_python
+            # to obtain child_outputs
+            child_outputs = {
+                block_type: self.child_blocks[block_type].bulk_to_python(
+                    child_input_list
+                )
+                for block_type, child_input_list in child_inputs.items()
+            }
+
+            # for each stream, go through the block map, picking out the appropriately-indexed
+            # value from the relevant list in child_outputs
+            return [
+                StreamValue(
+                    self,
+                    [
+                        (block_type, child_outputs[block_type][child_index], id)
+                        for block_type, id, child_index in block_map
+                    ],
+                    is_lazy=False,
+                )
+                for block_map in block_maps
+            ]
+        finally:
+            if token is not None:
+                _chooser_cache.reset(token)
 
     def get_prep_value(self, value):
         if not value:

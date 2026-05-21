@@ -1,3 +1,5 @@
+import json
+import uuid
 from io import StringIO
 from unittest import mock
 
@@ -7,6 +9,19 @@ from django.core import management
 from django.db.models import Count, Q
 from django.test import TestCase, TransactionTestCase, tag
 
+from wagtail.blocks import (
+    CharBlock,
+    ListBlock,
+    PageChooserBlock,
+    StreamBlock,
+    StructBlock,
+)
+from wagtail.documents.blocks import DocumentChooserBlock
+from wagtail.documents.models import Document
+from wagtail.documents.tests.utils import get_test_document_file
+from wagtail.images.blocks import ImageChooserBlock
+from wagtail.images.models import Image
+from wagtail.images.tests.utils import get_test_image_file
 from wagtail.models import Locale, Page, PageViewRestriction, Site, Workflow
 from wagtail.search.query import MATCH_ALL
 from wagtail.signals import page_unpublished
@@ -1367,3 +1382,233 @@ class TestFirstCommonAncestor(TestCase):
             self.assertNotIn("body", page.__dict__)
             with self.assertNumQueries(1):
                 page.body
+
+
+class TestStreamfieldChooserBatching(TestCase):
+    """
+    Chooser blocks that resolve to the same model are batched into a single
+    in_bulk query regardless of how many block-type buckets they occupy.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.root = Page.objects.filter(depth=1).first()
+        cls.hero = Image.objects.create(title="Test image", file=get_test_image_file())
+        cls.thumbnail = Image.objects.create(
+            title="Test image", file=get_test_image_file()
+        )
+        cls.og = Image.objects.create(title="Test image", file=get_test_image_file())
+        cls.bg = Image.objects.create(title="Test image", file=get_test_image_file())
+        cls.doc1 = Document.objects.create(title="Doc 1", file=get_test_document_file())
+        cls.doc2 = Document.objects.create(title="Doc 2", file=get_test_document_file())
+        cls.gallery_img = Image.objects.create(
+            title="Test image", file=get_test_image_file()
+        )
+        cls.slide1 = Image.objects.create(
+            title="Test image", file=get_test_image_file()
+        )
+        cls.slide2 = Image.objects.create(
+            title="Test image", file=get_test_image_file()
+        )
+        cls.related = StreamPage(title="Related", slug="batching-related", body=[])
+        cls.author = StreamPage(title="Author", slug="batching-author", body=[])
+        cls.root.add_child(instance=cls.related)
+        cls.root.add_child(instance=cls.author)
+
+    def _make_block(self):
+        return StreamBlock(
+            [
+                ("hero", ImageChooserBlock()),
+                ("thumbnail", ImageChooserBlock()),
+                ("og_image", ImageChooserBlock()),
+                ("background", ImageChooserBlock()),
+                ("attachment", DocumentChooserBlock()),
+                ("download", DocumentChooserBlock()),
+                ("related_page", PageChooserBlock()),
+                ("author_page", PageChooserBlock()),
+                # StructBlock with a chooser child — exercises BaseStructBlock branch
+                (
+                    "gallery",
+                    StructBlock(
+                        [("cover", ImageChooserBlock()), ("caption", CharBlock())]
+                    ),
+                ),
+                # ListBlock with a chooser child — exercises ListBlock branch
+                ("slideshow", ListBlock(ImageChooserBlock())),
+                ("heading", CharBlock()),
+            ]
+        )
+
+    def _raw_stream(self):
+        def b(block_type, value):
+            return {"type": block_type, "value": value, "id": str(uuid.uuid4())}
+
+        return [
+            [
+                b("hero", self.hero.pk),
+                b("thumbnail", self.thumbnail.pk),
+                b("og_image", self.og.pk),
+                b("background", self.bg.pk),
+                b("attachment", self.doc1.pk),
+                b("download", self.doc2.pk),
+                b("related_page", self.related.pk),
+                b("author_page", self.author.pk),
+                b("gallery", {"cover": self.gallery_img.pk, "caption": "A gallery"}),
+                b(
+                    "slideshow",
+                    [
+                        {
+                            "type": "item",
+                            "id": str(uuid.uuid4()),
+                            "value": self.slide1.pk,
+                        },
+                        {
+                            "type": "item",
+                            "id": str(uuid.uuid4()),
+                            "value": self.slide2.pk,
+                        },
+                    ],
+                ),
+                b("heading", "Latest news"),
+            ]
+        ]
+
+    def test_chooser_blocks_batched_by_model(self):
+        """
+        Four ImageChooserBlock types, two DocumentChooserBlock types, and two
+        PageChooserBlock types collapse to one in_bulk per model — three queries
+        total, not eight.
+        """
+        block = self._make_block()
+        with self.assertNumQueries(3):
+            results = block.bulk_to_python(self._raw_stream())
+            _ = [[b.value for b in stream] for stream in results]
+
+    def test_batched_values_are_correct(self):
+        block = self._make_block()
+        with self.assertNumQueries(3):
+            (stream,) = block.bulk_to_python(self._raw_stream())
+
+        by_type = {b.block_type: b.value for b in stream}
+        self.assertEqual(by_type["hero"].pk, self.hero.pk)
+        self.assertEqual(by_type["thumbnail"].pk, self.thumbnail.pk)
+        self.assertEqual(by_type["og_image"].pk, self.og.pk)
+        self.assertEqual(by_type["background"].pk, self.bg.pk)
+        self.assertEqual(by_type["attachment"].pk, self.doc1.pk)
+        self.assertEqual(by_type["download"].pk, self.doc2.pk)
+        self.assertEqual(by_type["related_page"].pk, self.related.pk)
+        self.assertEqual(by_type["author_page"].pk, self.author.pk)
+        self.assertEqual(by_type["gallery"]["cover"].pk, self.gallery_img.pk)
+        self.assertEqual(by_type["gallery"]["caption"], "A gallery")
+        self.assertEqual(by_type["slideshow"][0].pk, self.slide1.pk)
+        self.assertEqual(by_type["slideshow"][1].pk, self.slide2.pk)
+        self.assertEqual(by_type["heading"], "Latest news")
+
+
+class TestPrefetchStreamfieldChoosers(TestCase):
+    """
+    Tests for PageQuerySet.prefetch_streamfield_choosers() and
+    prefetch_streamfield_chooser_objects().
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.root = Page.objects.filter(depth=1).first()
+        cls.stream_pages = []
+        cls.page_images = []
+        cls.page_docs = []
+
+        for i in range(5):
+            imgs = [
+                Image.objects.create(title="Test image", file=get_test_image_file())
+                for _ in range(3)
+            ]
+            doc = Document.objects.create(
+                title="Test doc", file=get_test_document_file()
+            )
+            page = StreamPage(
+                title=f"Prefetch test page {i}",
+                slug=f"prefetch-test-{i}",
+                body=json.dumps(
+                    [
+                        {"type": "image", "value": imgs[0].pk, "id": str(uuid.uuid4())},
+                        {"type": "image", "value": imgs[1].pk, "id": str(uuid.uuid4())},
+                        {
+                            "type": "image_with_alt",
+                            "value": {
+                                "image": imgs[2].pk,
+                                "alt_text": "Alt text",
+                                "decorative": False,
+                            },
+                            "id": str(uuid.uuid4()),
+                        },
+                        {"type": "document", "value": doc.pk, "id": str(uuid.uuid4())},
+                    ]
+                ),
+            )
+            cls.root.add_child(instance=page)
+            cls.stream_pages.append(page)
+            cls.page_images.append(imgs)
+            cls.page_docs.append(doc)
+
+        cls.text_only_page = StreamPage(
+            title="Text only",
+            slug="prefetch-text-only",
+            body=json.dumps(
+                [{"type": "text", "value": "Hello world", "id": str(uuid.uuid4())}]
+            ),
+        )
+        cls.root.add_child(instance=cls.text_only_page)
+
+    def _qs(self):
+        pks = [p.pk for p in self.stream_pages]
+        return StreamPage.objects.filter(pk__in=pks).order_by("pk")
+
+    def test_baseline_fires_one_query_per_block_type_per_page(self):
+        pages = list(self._qs())
+        with self.assertNumQueries(15):
+            for page in pages:
+                _ = [block.value for block in page.body]
+
+    def test_prefetch_collapses_to_two_queries(self):
+        # 1 page SELECT + 1 Image in_bulk + 1 Document in_bulk
+        with self.assertNumQueries(3):
+            pages = list(self._qs().prefetch_streamfield_choosers())
+        with self.assertNumQueries(0):
+            for page in pages:
+                _ = [block.value for block in page.body]
+
+    def test_prefetch_yields_correct_values(self):
+        pages = list(self._qs().prefetch_streamfield_choosers())
+        for page, (img0, img1, img2), doc in zip(
+            pages, self.page_images, self.page_docs
+        ):
+            blocks = list(page.body)
+            self.assertEqual(blocks[0].value.pk, img0.pk)
+            self.assertEqual(blocks[1].value.pk, img1.pk)
+            self.assertEqual(blocks[2].value.pk, img2.pk)
+            self.assertEqual(blocks[3].value.pk, doc.pk)
+
+    def test_prefetch_noop_for_chooser_free_stream(self):
+        with self.assertNumQueries(1):
+            pages = list(
+                StreamPage.objects.filter(
+                    pk=self.text_only_page.pk
+                ).prefetch_streamfield_choosers()
+            )
+        with self.assertNumQueries(0):
+            _ = [block.value for block in pages[0].body]
+
+    def test_iterator_requires_chunk_size(self):
+        with self.assertRaises(ValueError):
+            list(self._qs().prefetch_streamfield_choosers().iterator())
+
+    def test_iterator_with_chunk_size(self):
+        # 1 page SELECT + 1 Image in_bulk + 1 Document in_bulk (all 5 pages in one chunk)
+        with self.assertNumQueries(3):
+            pages = list(
+                self._qs().prefetch_streamfield_choosers().iterator(chunk_size=10)
+            )
+        with self.assertNumQueries(0):
+            for page in pages:
+                _ = [block.value for block in page.body]
