@@ -2,7 +2,9 @@ import collections
 import itertools
 import json
 import re
-from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache, wraps
 from importlib import import_module
 
 from django import forms
@@ -24,6 +26,7 @@ __all__ = [
     "BaseBlock",
     "Block",
     "BoundBlock",
+    "BlockReference",
     "DeclarativeSubBlocksMetaclass",
     "BlockWidget",
     "BlockField",
@@ -98,6 +101,18 @@ class Block(metaclass=BaseBlock):
         self.definition_prefix = "blockdef-%d" % self.creation_counter
         Block.definition_registry[self.definition_prefix] = self
 
+        # Stable identity of the graph *node* this block materialises, used as the
+        # visited-set key for cycle detection in full-graph traversals (see
+        # guard_full_graph_method). It defaults to this instance's own object identity,
+        # which is correct for acyclic blocks and for hand-written cycles (where the
+        # cyclic edge resolves back to a shared child instance). Blocks rebuilt from a
+        # cyclic migration lookup overwrite this with their lookup index, so that the
+        # fresh instances produced on each reference resolution share an identity that
+        # id() cannot provide. This is deliberately separate from structural equality
+        # (__eq__): two structurally identical sibling blocks are distinct nodes, so
+        # equality must not be used to detect a cycle.
+        self._definition_id = id(self)
+
         self.label = self.meta.label or ""
         self.is_deferred_validation = False
         """
@@ -115,6 +130,36 @@ class Block(metaclass=BaseBlock):
         # In the base implementation, no lookups take place - args / kwargs are passed
         # on to the constructor as-is
         return cls(*args, **kwargs)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Automatically guard any of the full-graph traversal methods defined on this
+        # subclass, unless a parent class already provides a guarded version. This
+        # centralises cycle detection in base.py so block authors never need to import
+        # or apply the decorator manually.
+        #
+        # We skip adding a guard when a parent already has one so that super() calls
+        # don't double-enter the guard (which would cause premature cycle detection).
+        # The parent's guard already covers the full graph walk.
+        for method_name, on_reentry in [
+            ("check", []),
+            ("defer_required_validation", None),
+            ("restore_deferred_validation", None),
+        ]:
+            if method_name in cls.__dict__:
+                parent_is_guarded = any(
+                    getattr(vars(base).get(method_name), "_is_guarded", False)
+                    for base in cls.__mro__[1:]
+                    if method_name in vars(base)
+                )
+                if not parent_is_guarded:
+                    setattr(
+                        cls,
+                        method_name,
+                        guard_full_graph_method(on_reentry=on_reentry)(
+                            cls.__dict__[method_name]
+                        ),
+                    )
 
     def set_name(self, name):
         self.name = name
@@ -615,6 +660,10 @@ class Block(metaclass=BaseBlock):
             # the migration, rather than leaving the migration vulnerable to future changes to FooBlock / BarBlock
             # in models.py.
 
+        if self is other:
+            # Reflexivity fast-path: a block always equals itself.
+            return True
+
         return (
             self.name == other.name
             and self.deconstruct() == other.deconstruct()
@@ -623,6 +672,236 @@ class Block(metaclass=BaseBlock):
                 for attr in self.MUTABLE_META_ATTRIBUTES
             )
         )
+
+
+class BlockDict(collections.OrderedDict):
+    """
+    An ordered mapping of child blocks. Entries are normally ``Block`` instances, but
+    may be ``BlockReference`` instances for forward or cyclic references. A
+    ``BlockReference`` entry is resolved to a real block — named, and memoised in place —
+    the first time it is accessed, so the referenced class does not need to exist until
+    then.
+
+    Apart from this lazy resolution on read, it behaves exactly as a normal
+    ``OrderedDict`` (assignment does not resolve or rename — the container blocks name
+    their real children explicitly, as before).
+    """
+
+    class ValuesView(collections.abc.ValuesView):
+        def __iter__(self):
+            for key in self._mapping:
+                yield self._mapping[key]  # triggers __getitem__ → lazy resolution
+
+    class ItemsView(collections.abc.ItemsView):
+        def __iter__(self):
+            for key in self._mapping:
+                yield key, self._mapping[key]
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if isinstance(value, BlockReference):
+            value = value.resolve()
+            value.set_name(key)
+            super().__setitem__(key, value)
+        return value
+
+    def update(self, other=(), **kwargs):
+        # Copy raw values (including unresolved BlockReference entries) without
+        # triggering lazy resolution via __getitem__. Needed so that the metaclass
+        # MRO walk can copy declared_blocks into base_blocks before the referenced
+        # classes exist.
+        if hasattr(other, "keys"):
+            for key in other.keys():
+                collections.OrderedDict.__setitem__(
+                    self, key, collections.OrderedDict.__getitem__(other, key)
+                )
+        else:
+            for key, value in other:
+                collections.OrderedDict.__setitem__(self, key, value)
+        for key, value in kwargs.items():
+            collections.OrderedDict.__setitem__(self, key, value)
+
+    def copy(self):
+        result = type(self)()
+        for key in self:
+            collections.OrderedDict.__setitem__(
+                result, key, collections.OrderedDict.__getitem__(self, key)
+            )
+        return result
+
+    def values(self):
+        return self.ValuesView(self)
+
+    def items(self):
+        return self.ItemsView(self)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+
+@contextmanager
+def track_reentry(var, key, *, visit_once):
+    """
+    Track ``key`` in an ambient (ContextVar) set for the duration of the outermost
+    enclosing call, yielding ``True`` if ``key`` is already present (re-entry) or
+    ``False`` on first sight.
+
+    This is the shared bookkeeping for cycle detection on a block-definition graph,
+    where ``key`` is derived from ``Block._definition_id`` (so fresh re-materialisations
+    of one node are recognised). Two callers need slightly different membership scope:
+
+    - ``visit_once=True`` keeps the key for the whole walk, so each node is handled
+      exactly once even when reached by several paths (used by full-graph methods like
+      ``check``).
+    - ``visit_once=False`` removes the key once this call returns, so only keys on the
+      current recursion stack short-circuit (used for coinductive equality).
+    """
+    seen = var.get()
+    token = None
+    if seen is None:
+        seen = set()
+        token = var.set(seen)
+    try:
+        if key in seen:
+            yield True
+        else:
+            seen.add(key)
+            try:
+                yield False
+            finally:
+                if not visit_once:
+                    seen.discard(key)
+    finally:
+        if token is not None:
+            var.reset(token)
+
+
+# One walk-state ContextVar per guarded *operation* (keyed by method name), created on
+# demand when the decorator is applied. All blocks' `check` implementations share one
+# walk-state; `defer_required_validation` has its own; etc. — so two different full-graph
+# operations never share a visited-set, even if one is ever called within another.
+_full_graph_walk_vars = {}
+
+
+def guard_full_graph_method(on_reentry=None):
+    """
+    Guard a method that walks the whole block-definition graph against infinite
+    recursion on a cyclic graph.
+
+    A per-operation visited-set (keyed by each block's node identity, see
+    ``Block._definition_id``) is kept for the duration of the outermost call;
+    re-entering a node that has already been visited returns ``on_reentry`` instead of
+    recursing. Methods that walk the stored value rather than the definition are not
+    guarded — a cycle that passes through a sequence block (ListBlock/StreamBlock)
+    terminates through that block's empty default.
+
+    Applied automatically by ``Block.__init_subclass__``; no need to add this decorator
+    manually.
+    """
+
+    def decorator(method):
+        walk_var = _full_graph_walk_vars.setdefault(
+            method.__name__,
+            ContextVar("full_graph_walk_%s" % method.__name__, default=None),
+        )
+
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            # Key on node identity (_definition_id), not object identity: fresh
+            # re-materialisations of one cyclic node (rebuilt from a migration lookup)
+            # share a _definition_id even though their id() differs.
+            with track_reentry(
+                walk_var, self._definition_id, visit_once=True
+            ) as reentered:
+                if reentered:
+                    return on_reentry
+                return method(self, *args, **kwargs)
+
+        wrapped._is_guarded = True
+        return wrapped
+
+    return decorator
+
+
+# Node pairs currently being compared by BlockReference.__eq__, so that equality of a
+# cyclic block graph terminates instead of recursing through the reference forever.
+_reference_eq_in_progress = ContextVar("block_reference_eq", default=None)
+
+
+class BlockReference:
+    """
+    A deferred block reference that can be declared as a class-level attribute,
+    enabling forward references and cyclic block graphs.
+
+    Usage::
+
+        class AccordionBlock(blocks.StructBlock):
+            heading = blocks.CharBlock()
+            content = blocks.BlockReference(lambda: ContentStreamBlock)
+
+        class ContentStreamBlock(blocks.StreamBlock):
+            accordion = AccordionBlock()
+            paragraph = blocks.RichTextBlock()
+
+    The reference is resolved lazily on first access, so the target class does
+    not need to exist at definition time.
+    """
+
+    def __init__(self, ref):
+        self._ref = ref
+        self._resolved = None
+        self.name = ""
+        # Share Block's global creation counter so that class-level BlockReference
+        # declarations sort correctly alongside Block instances in the metaclass.
+        self.creation_counter = Block.creation_counter
+        Block.creation_counter += 1
+
+    def set_name(self, name):
+        self.name = name
+
+    def resolve(self):
+        if self._resolved is None:
+            ref = self._ref
+            if isinstance(ref, str):
+                module_name, _, class_name = ref.rpartition(".")
+                ref = getattr(import_module(module_name), class_name)
+            if isinstance(ref, type):
+                self._resolved = ref()
+            elif callable(ref):
+                result = ref()
+                self._resolved = result if isinstance(result, Block) else result()
+            else:
+                raise TypeError(
+                    "BlockReference expected a callable or dotted import path; got %r."
+                    % (self._ref,)
+                )
+            if self.name:
+                self._resolved.set_name(self.name)
+        return self._resolved
+
+    def __eq__(self, other):
+        # A reference is equal to whatever it resolves to, so a block holding an
+        # (unresolved) reference to a cyclic child compares equal to one holding the
+        # resolved block. Every cycle in a block graph runs through a BlockReference, so
+        # this is where we break it: comparing two cyclic graphs would otherwise recurse
+        # forever. We treat equality coinductively — record the (node, node) pairs
+        # currently on the comparison stack and, on meeting a pair again, assume it equal
+        # (the cycle has matched so far). The pair is keyed on _definition_id so the
+        # fresh instances a lookup produces for one node line up across the recursion.
+        if isinstance(other, BlockReference):
+            other = other.resolve()
+        if not isinstance(other, Block):
+            return NotImplemented
+
+        resolved = self.resolve()
+        pair = (resolved._definition_id, other._definition_id)
+        with track_reentry(
+            _reference_eq_in_progress, pair, visit_once=False
+        ) as reentered:
+            return True if reentered else resolved == other
+
+    # Defining __eq__ makes this unhashable by default, matching Block.
+    __hash__ = None
 
 
 class BoundBlock:
@@ -674,14 +953,18 @@ class DeclarativeSubBlocksMetaclass(BaseBlock):
                 current_blocks.append((key, value))
                 value.set_name(key)
                 attrs.pop(key)
+            elif isinstance(value, BlockReference):
+                current_blocks.append((key, value))
+                value.set_name(key)
+                attrs.pop(key)
         current_blocks.sort(key=lambda x: x[1].creation_counter)
-        attrs["declared_blocks"] = collections.OrderedDict(current_blocks)
+        attrs["declared_blocks"] = BlockDict(current_blocks)
 
         new_class = super().__new__(mcs, name, bases, attrs)
 
         # Walk through the MRO, collecting all inherited sub-blocks, to make
         # the combined `base_blocks`.
-        base_blocks = collections.OrderedDict()
+        base_blocks = BlockDict()
         for base in reversed(new_class.__mro__):
             # Collect sub-blocks from base class.
             if hasattr(base, "declared_blocks"):

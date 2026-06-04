@@ -546,3 +546,26 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertTrue(text_block.required)
         country_block = struct_block.child_blocks["country"]
         self.assertIsInstance(country_block, blocks.ChoiceBlock)
+
+    def test_typed_table_block_self_reference_terminates(self):
+        # A TypedTableBlock whose lookup entry references itself (index 0 → index 0)
+        # must terminate in check(). The guard on BaseTypedTableBlock.check() detects
+        # re-entry by node identity (_definition_id) and returns [] instead of recursing.
+        # The self-referential column resolves to a fresh instance (Wagtail builds a
+        # fresh block per reference), not the parent itself.
+        lookup = BlockDefinitionLookup(
+            {
+                0: (
+                    "wagtail.contrib.typed_table_block.blocks.TypedTableBlock",
+                    [[("nested", 0)]],  # column 0 refers back to index 0 itself
+                    {},
+                )
+            }
+        )
+        rebuilt = lookup.get_block(0)
+
+        self.assertIsInstance(rebuilt, TypedTableBlock)
+        nested = rebuilt.child_blocks["nested"]
+        self.assertIsInstance(nested, TypedTableBlock)
+        self.assertIsNot(nested, rebuilt)
+        self.assertEqual(rebuilt.check(), [])

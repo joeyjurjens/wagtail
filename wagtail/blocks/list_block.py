@@ -13,6 +13,7 @@ from wagtail.admin.telepath import Adapter, register
 
 from .base import (
     Block,
+    BlockReference,
     BoundBlock,
     get_error_json_data,
     get_error_list_json_data,
@@ -143,14 +144,29 @@ class ListBlock(Block):
         self.search_index = search_index
         if isinstance(child_block, type):
             # child_block was passed as a class, so convert it to a block instance
-            self.child_block = child_block()
+            self._child_block = child_block()
         else:
-            self.child_block = child_block
+            self._child_block = child_block
 
         self._has_default = hasattr(self.meta, "default")
         if not self._has_default:
-            # Default to a list consisting of one empty (i.e. default-valued) child item
-            self.meta.default = [self.child_block.get_default()]
+            if isinstance(self._child_block, BlockReference):
+                # A deferred (possibly cyclic) child cannot be eagerly default-valued
+                # without recursing forever, so default to an empty list.
+                self.meta.default = []
+            else:
+                # Default to a list consisting of one empty (i.e. default-valued) child item
+                self.meta.default = [self._child_block.get_default()]
+
+    @property
+    def child_block(self):
+        if isinstance(self._child_block, BlockReference):
+            self._child_block = self._child_block.resolve()
+        return self._child_block
+
+    @child_block.setter
+    def child_block(self, value):
+        self._child_block = value
 
     # If a subclass of ListBlock overrides __init__, we cannot assume that the first argument is
     # the child block, and thus we cannot rely on the conversion applied in construct_from_lookup /
@@ -314,7 +330,14 @@ class ListBlock(Block):
                 else:
                     raw_values.append(list_child)
 
-        converted_values = self.child_block.bulk_to_python(raw_values)
+        if raw_values:
+            converted_values = self.child_block.bulk_to_python(raw_values)
+        else:
+            # Don't resolve child_block when there is nothing to convert. For a cyclic
+            # child this matters for termination, not just efficiency: resolving it
+            # builds a fresh block whose own bulk_to_python would resolve its child in
+            # turn, descending forever even though there is no data at this level.
+            converted_values = []
 
         # split converted_values back into sub-lists of the original lengths
         result = []
@@ -432,15 +455,16 @@ class ListBlock(Block):
     def deconstruct_with_lookup(self, lookup):
         path, args, kwargs = super().deconstruct_with_lookup(lookup)
         if getattr(self.__init__, "has_child_block_arg", False):
-            if args and isinstance(args[0], Block):
-                block_id = lookup.add_block(args[0])
-                args = (block_id, *args[1:])
-            else:
-                child_block = kwargs.get("child_block")
-                if isinstance(child_block, Block):
-                    block_id = lookup.add_block(child_block)
-                    kwargs = kwargs.copy()  # avoid mutating the original kwargs stored in self._constructor_args
-                    kwargs["child_block"] = block_id
+            # The child may be stored as a Block, or as an unresolved BlockReference for
+            # a forward/cyclic definition; self.child_block resolves either to the real
+            # block. Replace it with its index in the lookup table.
+            if args and isinstance(args[0], (Block, BlockReference)):
+                args = (lookup.add_block(self.child_block), *args[1:])
+            elif isinstance(kwargs.get("child_block"), (Block, BlockReference)):
+                kwargs = (
+                    kwargs.copy()
+                )  # avoid mutating the original kwargs stored in self._constructor_args
+                kwargs["child_block"] = lookup.add_block(self.child_block)
 
         return path, args, kwargs
 

@@ -17,6 +17,7 @@ from wagtail.coreutils import safe_snake_case
 
 from .base import (
     Block,
+    BlockReference,
     BoundBlock,
     DeclarativeSubBlocksMetaclass,
     get_error_json_data,
@@ -247,20 +248,22 @@ class BaseStructBlock(Block):
         self.child_blocks = self.base_blocks.copy()
         if local_blocks:
             for name, block in local_blocks:
-                block.set_name(name)
+                # A real block is named now; a deferred reference is named when it is
+                # resolved on first access (it has no set_name until then).
+                if not isinstance(block, BlockReference):
+                    block.set_name(name)
                 self.child_blocks[name] = block
 
         self.meta.form_layout = self.get_form_layout()
 
-        # Reorder child_blocks to match form_layout, appending any missing
-        # blocks to the end
+        # Reorder child_blocks to match form_layout, appending any missing blocks to the
+        # end. move_to_end reorders by key without reading (and so without resolving) any
+        # deferred-reference entries.
         sorted_block_names = self.meta.form_layout.get_sorted_block_names()
         sorted_set = set(sorted_block_names)
         missing_block_names = [k for k in self.child_blocks if k not in sorted_set]
-        self.child_blocks = collections.OrderedDict(
-            (name, self.child_blocks[name])
-            for name in (sorted_block_names + missing_block_names)
-        )
+        for name in sorted_block_names + missing_block_names:
+            self.child_blocks.move_to_end(name)
 
     @classmethod
     def construct_from_lookup(cls, lookup, child_blocks, **kwargs):
@@ -489,8 +492,46 @@ class BaseStructBlock(Block):
             errors.extend(child_block.check(**kwargs))
             errors.extend(child_block._check_name(**kwargs))
         errors.extend(self._check_form_layout())
+        errors.extend(self._check_struct_only_cycle())
 
         return errors
+
+    def _check_struct_only_cycle(self):
+        # A StructBlock builds its default by defaulting every child, so a cycle of
+        # nothing but StructBlocks has no finite default and could not be rendered. Any
+        # non-StructBlock on the path (a ListBlock, StreamBlock, etc.) has an empty
+        # default that breaks the cycle, so we walk StructBlock -> StructBlock edges only
+        # and report if we get back to self. This relies on StructBlock being the only
+        # block whose get_default() descends into its children, which holds for every
+        # built-in block; a custom block that overrides get_default() to descend would
+        # not be detected here.
+        start_id = self._definition_id
+
+        def reaches_start(block, visited_ids):
+            for child_block in block.child_blocks.values():
+                if not isinstance(child_block, BaseStructBlock):
+                    continue
+                child_id = child_block._definition_id
+                if child_id == start_id:
+                    return True
+                if child_id not in visited_ids and reaches_start(
+                    child_block, visited_ids | {child_id}
+                ):
+                    return True
+            return False
+
+        if reaches_start(self, frozenset()):
+            return [
+                checks.Error(
+                    f"{self.__class__.__name__} cannot contain itself through a chain "
+                    "of StructBlocks only, as it would have no finite default value and "
+                    "could not be rendered. Nest the recursive child in a ListBlock or "
+                    "StreamBlock instead.",
+                    obj=self,
+                    id="wagtailcore.E008",
+                )
+            ]
+        return []
 
     def _check_form_layout(self):
         if self.meta.form_template and any(

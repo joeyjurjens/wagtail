@@ -17,6 +17,7 @@ from wagtail.admin.telepath import Adapter, register
 
 from .base import (
     Block,
+    BlockReference,
     BoundBlock,
     DeclarativeSubBlocksMetaclass,
     get_error_json_data,
@@ -85,7 +86,10 @@ class BaseStreamBlock(Block):
         self.child_blocks = self.base_blocks.copy()
         if local_blocks:
             for name, block in local_blocks:
-                block.set_name(name)
+                # A real block is named now; a deferred reference is named lazily when it
+                # is resolved on first access (it has no set_name until then).
+                if not isinstance(block, BlockReference):
+                    block.set_name(name)
                 self.child_blocks[name] = block
 
     @classmethod
