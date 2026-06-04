@@ -17,6 +17,7 @@ from .base import (
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
+    guard_full_graph_method,
 )
 
 __all__ = ["ListBlock", "ListBlockValidationError"]
@@ -141,16 +142,42 @@ class ListBlock(Block):
     def __init__(self, child_block, search_index=True, **kwargs):
         super().__init__(**kwargs)
         self.search_index = search_index
-        if isinstance(child_block, type):
+        if Block.is_reference(child_block):
+            # A deferred reference (a callable or dotted path). It cannot be resolved
+            # now — the referenced block may not exist yet (forward / cyclic reference) —
+            # so it is resolved lazily on first access of `child_block`.
+            self._child_block = None
+            self._child_block_ref = child_block
+        elif isinstance(child_block, type):
             # child_block was passed as a class, so convert it to a block instance
-            self.child_block = child_block()
+            self._child_block = child_block()
+            self._child_block_ref = None
         else:
-            self.child_block = child_block
+            self._child_block = child_block
+            self._child_block_ref = None
 
         self._has_default = hasattr(self.meta, "default")
         if not self._has_default:
-            # Default to a list consisting of one empty (i.e. default-valued) child item
-            self.meta.default = [self.child_block.get_default()]
+            if self._child_block_ref is not None:
+                # A deferred (possibly cyclic) child cannot be eagerly default-valued
+                # without recursing forever, so default to an empty list.
+                self.meta.default = []
+            else:
+                # Default to a list consisting of one empty (i.e. default-valued) child item
+                self.meta.default = [self._child_block.get_default()]
+
+    @property
+    def child_block(self):
+        # A deferred reference is resolved on first access and memoised, so the result is
+        # a real block; a cyclic reference closes onto an already-built block.
+        if self._child_block is None and self._child_block_ref is not None:
+            self._child_block = Block.resolve_reference(self._child_block_ref)
+        return self._child_block
+
+    @child_block.setter
+    def child_block(self, value):
+        self._child_block = value
+        self._child_block_ref = None
 
     # If a subclass of ListBlock overrides __init__, we cannot assume that the first argument is
     # the child block, and thus we cannot rely on the conversion applied in construct_from_lookup /
@@ -162,12 +189,12 @@ class ListBlock(Block):
     def construct_from_lookup(cls, lookup, *args, **kwargs):
         if getattr(cls.__init__, "has_child_block_arg", False):
             if args and isinstance(args[0], int):
-                child_block = lookup.get_block(args[0])
+                child_block = lookup.get_block_reference(args[0])
                 args = (child_block, *args[1:])
             else:
                 child_block_kwarg = kwargs.get("child_block")
                 if isinstance(child_block_kwarg, int):
-                    child_block = lookup.get_block(child_block_kwarg)
+                    child_block = lookup.get_block_reference(child_block_kwarg)
                     kwargs["child_block"] = child_block
 
         return cls(*args, **kwargs)
@@ -197,6 +224,7 @@ class ListBlock(Block):
     def value_omitted_from_data(self, data, files, prefix):
         return ("%s-count" % prefix) not in data
 
+    @guard_full_graph_method()
     def defer_required_validation(self):
         super().defer_required_validation()
         self.child_block.defer_required_validation()
@@ -248,6 +276,7 @@ class ListBlock(Block):
 
         return ListValue(self, bound_blocks=result)
 
+    @guard_full_graph_method()
     def restore_deferred_validation(self):
         self.child_block.restore_deferred_validation()
         super().restore_deferred_validation()
@@ -314,7 +343,13 @@ class ListBlock(Block):
                 else:
                     raw_values.append(list_child)
 
-        converted_values = self.child_block.bulk_to_python(raw_values)
+        # Short-circuit: don't access child_block when there is nothing to convert.
+        # This avoids resolving a cyclic reference unnecessarily, which would
+        # create a fresh (unconnected) block instance and recurse infinitely.
+        if not raw_values:
+            converted_values = []
+        else:
+            converted_values = self.child_block.bulk_to_python(raw_values)
 
         # split converted_values back into sub-lists of the original lengths
         result = []
@@ -424,6 +459,7 @@ class ListBlock(Block):
             # an empty path refers to the list as a whole
             return self.bind(value)
 
+    @guard_full_graph_method(on_reentry=[])
     def check(self, **kwargs):
         errors = super().check(**kwargs)
         errors.extend(self.child_block.check(**kwargs))
@@ -435,10 +471,17 @@ class ListBlock(Block):
             if args and isinstance(args[0], Block):
                 block_id = lookup.add_block(args[0])
                 args = (block_id, *args[1:])
+            elif args and Block.is_reference(args[0]):
+                block_id = lookup.add_block(self.child_block)
+                args = (block_id, *args[1:])
             else:
                 child_block = kwargs.get("child_block")
                 if isinstance(child_block, Block):
                     block_id = lookup.add_block(child_block)
+                    kwargs = kwargs.copy()  # avoid mutating the original kwargs stored in self._constructor_args
+                    kwargs["child_block"] = block_id
+                elif Block.is_reference(child_block):
+                    block_id = lookup.add_block(self.child_block)
                     kwargs = kwargs.copy()  # avoid mutating the original kwargs stored in self._constructor_args
                     kwargs["child_block"] = block_id
 

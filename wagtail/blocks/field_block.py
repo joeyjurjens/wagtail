@@ -25,7 +25,7 @@ from wagtail.rich_text import (
     get_text_for_indexing,
 )
 
-from .base import Block
+from .base import Block, guard_full_graph_method
 
 
 class FieldBlock(Block):
@@ -62,6 +62,7 @@ class FieldBlock(Block):
     def value_omitted_from_data(self, data, files, prefix):
         return self.field.widget.value_omitted_from_data(data, files, prefix)
 
+    @guard_full_graph_method()
     def defer_required_validation(self):
         super().defer_required_validation()
         self._original_required = self.required
@@ -73,6 +74,7 @@ class FieldBlock(Block):
         # the one this block works with natively
         return self.value_from_form(self.field.clean(self.value_for_form(value)))
 
+    @guard_full_graph_method()
     def restore_deferred_validation(self):
         self.field.required = self._original_required
         super().restore_deferred_validation()

@@ -22,6 +22,7 @@ from .base import (
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
+    guard_full_graph_method,
 )
 
 __all__ = [
@@ -247,26 +248,28 @@ class BaseStructBlock(Block):
         self.child_blocks = self.base_blocks.copy()
         if local_blocks:
             for name, block in local_blocks:
-                block.set_name(name)
+                # A real block is named now; a deferred reference is named when it is
+                # resolved on first access (it has no set_name until then).
+                if not Block.is_reference(block):
+                    block.set_name(name)
                 self.child_blocks[name] = block
 
         self.meta.form_layout = self.get_form_layout()
 
-        # Reorder child_blocks to match form_layout, appending any missing
-        # blocks to the end
+        # Reorder child_blocks to match form_layout, appending any missing blocks to the
+        # end. move_to_end reorders by key without reading (and so without resolving) any
+        # deferred-reference entries.
         sorted_block_names = self.meta.form_layout.get_sorted_block_names()
         sorted_set = set(sorted_block_names)
         missing_block_names = [k for k in self.child_blocks if k not in sorted_set]
-        self.child_blocks = collections.OrderedDict(
-            (name, self.child_blocks[name])
-            for name in (sorted_block_names + missing_block_names)
-        )
+        for name in sorted_block_names + missing_block_names:
+            self.child_blocks.move_to_end(name)
 
     @classmethod
     def construct_from_lookup(cls, lookup, child_blocks, **kwargs):
         if child_blocks:
             child_blocks = [
-                (name, lookup.get_block(index)) for name, index in child_blocks
+                (name, lookup.get_block_reference(index)) for name, index in child_blocks
             ]
         return cls(child_blocks, **kwargs)
 
@@ -302,6 +305,7 @@ class BaseStructBlock(Block):
             for name, block in self.child_blocks.items()
         )
 
+    @guard_full_graph_method()
     def defer_required_validation(self):
         super().defer_required_validation()
         for block in self.child_blocks.values():
@@ -321,6 +325,7 @@ class BaseStructBlock(Block):
 
         return self._to_struct_value(result)
 
+    @guard_full_graph_method()
     def restore_deferred_validation(self):
         for block in self.child_blocks.values():
             block.restore_deferred_validation()
@@ -483,6 +488,7 @@ class BaseStructBlock(Block):
         kwargs = self._constructor_kwargs
         return (path, args, kwargs)
 
+    @guard_full_graph_method(on_reentry=[])
     def check(self, **kwargs):
         errors = super().check(**kwargs)
         for name, child_block in self.child_blocks.items():

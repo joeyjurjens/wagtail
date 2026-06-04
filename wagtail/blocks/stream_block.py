@@ -22,6 +22,7 @@ from .base import (
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
+    guard_full_graph_method,
 )
 
 __all__ = [
@@ -85,14 +86,17 @@ class BaseStreamBlock(Block):
         self.child_blocks = self.base_blocks.copy()
         if local_blocks:
             for name, block in local_blocks:
-                block.set_name(name)
+                # A real block is named now; a deferred reference is named lazily when it
+                # is resolved on first access (it has no set_name until then).
+                if not Block.is_reference(block):
+                    block.set_name(name)
                 self.child_blocks[name] = block
 
     @classmethod
     def construct_from_lookup(cls, lookup, child_blocks, **kwargs):
         if child_blocks:
             child_blocks = [
-                (name, lookup.get_block(index)) for name, index in child_blocks
+                (name, lookup.get_block_reference(index)) for name, index in child_blocks
             ]
         return cls(child_blocks, **kwargs)
 
@@ -161,6 +165,7 @@ class BaseStreamBlock(Block):
     def required(self):
         return self.meta.required
 
+    @guard_full_graph_method()
     def defer_required_validation(self):
         super().defer_required_validation()
         for child_block in self.child_blocks.values():
@@ -238,6 +243,7 @@ class BaseStreamBlock(Block):
 
         return StreamValue(self, cleaned_data)
 
+    @guard_full_graph_method()
     def restore_deferred_validation(self):
         for child_block in self.child_blocks.values():
             child_block.restore_deferred_validation()
@@ -465,6 +471,7 @@ class BaseStreamBlock(Block):
         kwargs = self._constructor_kwargs
         return (path, args, kwargs)
 
+    @guard_full_graph_method(on_reentry=[])
     def check(self, **kwargs):
         errors = super().check(**kwargs)
         for name, child_block in self.child_blocks.items():
