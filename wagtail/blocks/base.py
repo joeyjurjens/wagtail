@@ -25,7 +25,7 @@ __all__ = [
     "BaseBlock",
     "Block",
     "BoundBlock",
-    "ReferenceBlock",
+    "BlockReference",
     "DeclarativeSubBlocksMetaclass",
     "BlockWidget",
     "BlockField",
@@ -62,14 +62,16 @@ _full_graph_walk_vars = {}
 
 def guard_full_graph_method(on_reentry=None):
     """
-    Guard a method that walks the whole block-definition graph (``check``,
-    ``defer_required_validation``, ``restore_deferred_validation``) against infinite
+    Guard a method that walks the whole block-definition graph against infinite
     recursion on a cyclic graph.
 
-    A per-operation visited-set (of ``id(block)``) is kept for the duration of the
-    outermost call; re-entering the same block returns ``on_reentry`` instead of
-    recursing. Value/render methods are deliberately *not* guarded — a supported cycle
-    terminates through a sequence block's empty default.
+    A per-operation visited-set (keyed by ``id(block)``) is kept for the duration of
+    the outermost call; re-entering the same block instance returns ``on_reentry``
+    instead of recursing. Value/render methods are deliberately not guarded — a
+    supported cycle terminates through a sequence block's empty default.
+
+    Applied automatically by ``Block.__init_subclass__``; no need to add this decorator
+    manually.
     """
 
     def decorator(method):
@@ -96,6 +98,7 @@ def guard_full_graph_method(on_reentry=None):
                 if token is not None:
                     walk_var.reset(token)
 
+        wrapped._is_guarded = True
         return wrapped
 
     return decorator
@@ -165,6 +168,36 @@ class Block(metaclass=BaseBlock):
         # In the base implementation, no lookups take place - args / kwargs are passed
         # on to the constructor as-is
         return cls(*args, **kwargs)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Automatically guard any of the full-graph traversal methods defined on this
+        # subclass, unless a parent class already provides a guarded version. This
+        # centralises cycle detection in base.py so block authors never need to import
+        # or apply the decorator manually.
+        #
+        # We skip adding a guard when a parent already has one so that super() calls
+        # don't double-enter the guard (which would cause premature cycle detection).
+        # The parent's guard already covers the full graph walk.
+        for method_name, on_reentry in [
+            ("check", []),
+            ("defer_required_validation", None),
+            ("restore_deferred_validation", None),
+        ]:
+            if method_name in cls.__dict__:
+                parent_is_guarded = any(
+                    getattr(vars(base).get(method_name), "_is_guarded", False)
+                    for base in cls.__mro__[1:]
+                    if method_name in vars(base)
+                )
+                if not parent_is_guarded:
+                    setattr(
+                        cls,
+                        method_name,
+                        guard_full_graph_method(on_reentry=on_reentry)(
+                            cls.__dict__[method_name]
+                        ),
+                    )
 
     def set_name(self, name):
         self.name = name
@@ -679,57 +712,14 @@ class Block(metaclass=BaseBlock):
             )
         )
 
-    @staticmethod
-    def resolve_reference(reference):
-        """
-        Resolve a deferred block *reference* to a ``Block`` instance.
-
-        A reference lets a block graph express a forward / cyclic link without the
-        referenced class needing to exist yet at definition time. It may be:
-
-        * a callable returning a block class or instance, e.g. ``lambda: CommentBlock``;
-        * a dotted import path string, e.g. ``"myapp.blocks.CommentBlock"``;
-        * a block class or instance (used as-is / instantiated).
-
-        Resolution happens lazily, when the referencing block's children are first
-        accessed, so the target is fully defined / importable by then.
-        """
-        if isinstance(reference, Block):
-            if getattr(reference, "_is_reference_block", False):
-                return reference.resolve()
-            return reference
-        if isinstance(reference, str):
-            module_name, _, class_name = reference.rpartition(".")
-            reference = getattr(import_module(module_name), class_name)
-        if isinstance(reference, type):
-            return reference()
-        if callable(reference):
-            result = reference()
-            return result if isinstance(result, Block) else result()
-        raise TypeError(
-            "Expected a block, a block class, or a block reference (a callable returning "
-            "a block, or a dotted import path); got %r." % (reference,)
-        )
-
-    @staticmethod
-    def is_reference(value):
-        """
-        True if ``value`` is a deferred block reference (a callable, dotted path,
-        or ``ReferenceBlock``), i.e. not already a resolved ``Block`` instance.
-        """
-        if isinstance(value, Block):
-            return getattr(value, "_is_reference_block", False)
-        if isinstance(value, type):
-            return False
-        return isinstance(value, str) or callable(value)
-
 
 class BlockDict(collections.OrderedDict):
     """
-    An ordered mapping of child blocks in which an entry may be a deferred block
-    *reference* (a callable or dotted path) instead of a block. Such an entry is resolved
-    to a real block — named, and memoised in place — the first time it is accessed, so a
-    forward / cyclic reference is not resolved until the referenced block exists.
+    An ordered mapping of child blocks. Entries are normally ``Block`` instances, but
+    may be ``BlockReference`` instances for forward or cyclic references. A
+    ``BlockReference`` entry is resolved to a real block — named, and memoised in place —
+    the first time it is accessed, so the referenced class does not need to exist until
+    then.
 
     Apart from this lazy resolution on read, it behaves exactly as a normal
     ``OrderedDict`` (assignment does not resolve or rename — the container blocks name
@@ -739,7 +729,7 @@ class BlockDict(collections.OrderedDict):
     class ValuesView(collections.abc.ValuesView):
         def __iter__(self):
             for key in self._mapping:
-                yield self._mapping[key]  # triggers BlockDict.__getitem__ → lazy resolution
+                yield self._mapping[key]  # triggers __getitem__ → lazy resolution
 
     class ItemsView(collections.abc.ItemsView):
         def __iter__(self):
@@ -748,16 +738,14 @@ class BlockDict(collections.OrderedDict):
 
     def __getitem__(self, key):
         value = super().__getitem__(key)
-        if Block.is_reference(value):
-            value = Block.resolve_reference(value)
+        if isinstance(value, BlockReference):
+            value = value.resolve()
             value.set_name(key)
-            # memoise the resolved block in place (bypassing __setitem__'s naming, which
-            # we have already done)
             super().__setitem__(key, value)
         return value
 
     def update(self, other=(), **kwargs):
-        # Copy raw values (including unresolved ReferenceBlock entries) without
+        # Copy raw values (including unresolved BlockReference entries) without
         # triggering lazy resolution via __getitem__. Needed so that the metaclass
         # MRO walk can copy declared_blocks into base_blocks before the referenced
         # classes exist.
@@ -790,17 +778,16 @@ class BlockDict(collections.OrderedDict):
         return self[key] if key in self else default
 
 
-class ReferenceBlock(Block):
+class BlockReference:
     """
     A deferred block reference that can be declared as a class-level attribute,
-    enabling forward references and cyclic block graphs without a separate
-    ``LazyBlock`` wrapper.
+    enabling forward references and cyclic block graphs.
 
     Usage::
 
         class AccordionBlock(blocks.StructBlock):
             heading = blocks.CharBlock()
-            content = blocks.ReferenceBlock(lambda: ContentStreamBlock)
+            content = blocks.BlockReference(lambda: ContentStreamBlock)
 
         class ContentStreamBlock(blocks.StreamBlock):
             accordion = AccordionBlock()
@@ -810,24 +797,37 @@ class ReferenceBlock(Block):
     not need to exist at definition time.
     """
 
-    _is_reference_block = True
-
-    def __init__(self, ref, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, ref):
         self._ref = ref
         self._resolved = None
+        self.name = ""
+        # Share Block's global creation counter so that class-level BlockReference
+        # declarations sort correctly alongside Block instances in the metaclass.
+        self.creation_counter = Block.creation_counter
+        Block.creation_counter += 1
+
+    def set_name(self, name):
+        self.name = name
 
     def resolve(self):
         if self._resolved is None:
-            self._resolved = Block.resolve_reference(self._ref)
+            ref = self._ref
+            if isinstance(ref, str):
+                module_name, _, class_name = ref.rpartition(".")
+                ref = getattr(import_module(module_name), class_name)
+            if isinstance(ref, type):
+                self._resolved = ref()
+            elif callable(ref):
+                result = ref()
+                self._resolved = result if isinstance(result, Block) else result()
+            else:
+                raise TypeError(
+                    "BlockReference expected a callable or dotted import path; got %r."
+                    % (self._ref,)
+                )
             if self.name:
                 self._resolved.set_name(self.name)
         return self._resolved
-
-    def set_name(self, name):
-        super().set_name(name)
-        if self._resolved is not None:
-            self._resolved.set_name(name)
 
 
 class BoundBlock:
@@ -876,6 +876,10 @@ class DeclarativeSubBlocksMetaclass(BaseBlock):
         current_blocks = []
         for key, value in list(attrs.items()):
             if isinstance(value, Block):
+                current_blocks.append((key, value))
+                value.set_name(key)
+                attrs.pop(key)
+            elif isinstance(value, BlockReference):
                 current_blocks.append((key, value))
                 value.set_name(key)
                 attrs.pop(key)

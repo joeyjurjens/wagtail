@@ -13,11 +13,11 @@ from wagtail.admin.telepath import Adapter, register
 
 from .base import (
     Block,
+    BlockReference,
     BoundBlock,
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
-    guard_full_graph_method,
 )
 
 __all__ = ["ListBlock", "ListBlockValidationError"]
@@ -142,23 +142,15 @@ class ListBlock(Block):
     def __init__(self, child_block, search_index=True, **kwargs):
         super().__init__(**kwargs)
         self.search_index = search_index
-        if Block.is_reference(child_block):
-            # A deferred reference (a callable or dotted path). It cannot be resolved
-            # now — the referenced block may not exist yet (forward / cyclic reference) —
-            # so it is resolved lazily on first access of `child_block`.
-            self._child_block = None
-            self._child_block_ref = child_block
-        elif isinstance(child_block, type):
+        if isinstance(child_block, type):
             # child_block was passed as a class, so convert it to a block instance
             self._child_block = child_block()
-            self._child_block_ref = None
         else:
             self._child_block = child_block
-            self._child_block_ref = None
 
         self._has_default = hasattr(self.meta, "default")
         if not self._has_default:
-            if self._child_block_ref is not None:
+            if isinstance(self._child_block, BlockReference):
                 # A deferred (possibly cyclic) child cannot be eagerly default-valued
                 # without recursing forever, so default to an empty list.
                 self.meta.default = []
@@ -168,16 +160,13 @@ class ListBlock(Block):
 
     @property
     def child_block(self):
-        # A deferred reference is resolved on first access and memoised, so the result is
-        # a real block; a cyclic reference closes onto an already-built block.
-        if self._child_block is None and self._child_block_ref is not None:
-            self._child_block = Block.resolve_reference(self._child_block_ref)
+        if isinstance(self._child_block, BlockReference):
+            self._child_block = self._child_block.resolve()
         return self._child_block
 
     @child_block.setter
     def child_block(self, value):
         self._child_block = value
-        self._child_block_ref = None
 
     # If a subclass of ListBlock overrides __init__, we cannot assume that the first argument is
     # the child block, and thus we cannot rely on the conversion applied in construct_from_lookup /
@@ -189,13 +178,13 @@ class ListBlock(Block):
     def construct_from_lookup(cls, lookup, *args, **kwargs):
         if getattr(cls.__init__, "has_child_block_arg", False):
             if args and isinstance(args[0], int):
-                child_block = lookup.get_block_reference(args[0])
-                args = (child_block, *args[1:])
+                args = (lookup.get_block_reference(args[0]), *args[1:])
             else:
                 child_block_kwarg = kwargs.get("child_block")
                 if isinstance(child_block_kwarg, int):
-                    child_block = lookup.get_block_reference(child_block_kwarg)
-                    kwargs["child_block"] = child_block
+                    kwargs["child_block"] = lookup.get_block_reference(
+                        child_block_kwarg
+                    )
 
         return cls(*args, **kwargs)
 
@@ -224,7 +213,6 @@ class ListBlock(Block):
     def value_omitted_from_data(self, data, files, prefix):
         return ("%s-count" % prefix) not in data
 
-    @guard_full_graph_method()
     def defer_required_validation(self):
         super().defer_required_validation()
         self.child_block.defer_required_validation()
@@ -276,7 +264,6 @@ class ListBlock(Block):
 
         return ListValue(self, bound_blocks=result)
 
-    @guard_full_graph_method()
     def restore_deferred_validation(self):
         self.child_block.restore_deferred_validation()
         super().restore_deferred_validation()
@@ -459,7 +446,6 @@ class ListBlock(Block):
             # an empty path refers to the list as a whole
             return self.bind(value)
 
-    @guard_full_graph_method(on_reentry=[])
     def check(self, **kwargs):
         errors = super().check(**kwargs)
         errors.extend(self.child_block.check(**kwargs))
@@ -471,7 +457,7 @@ class ListBlock(Block):
             if args and isinstance(args[0], Block):
                 block_id = lookup.add_block(args[0])
                 args = (block_id, *args[1:])
-            elif args and Block.is_reference(args[0]):
+            elif args and isinstance(args[0], BlockReference):
                 block_id = lookup.add_block(self.child_block)
                 args = (block_id, *args[1:])
             else:
@@ -480,9 +466,9 @@ class ListBlock(Block):
                     block_id = lookup.add_block(child_block)
                     kwargs = kwargs.copy()  # avoid mutating the original kwargs stored in self._constructor_args
                     kwargs["child_block"] = block_id
-                elif Block.is_reference(child_block):
+                elif isinstance(child_block, BlockReference):
                     block_id = lookup.add_block(self.child_block)
-                    kwargs = kwargs.copy()  # avoid mutating the original kwargs stored in self._constructor_args
+                    kwargs = kwargs.copy()
                     kwargs["child_block"] = block_id
 
         return path, args, kwargs

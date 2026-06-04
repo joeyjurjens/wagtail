@@ -1,6 +1,8 @@
 from collections import defaultdict
 from importlib import import_module
 
+from wagtail.blocks.base import BlockReference
+
 
 class BlockDefinitionLookup:
     """
@@ -61,15 +63,15 @@ class BlockDefinitionLookup:
         return block
 
     def get_block_reference(self, index):
-        # A deferred reference to a lookup entry: container blocks pass this (rather than a
-        # resolved block) so that a cyclic entry is only built when first accessed, letting
-        # the cycle close via the cache in get_block.
+        # Returns a BlockReference that resolves to the block at `index` on first access.
+        # Container blocks use this instead of get_block() so that cyclic entries are only
+        # built when first accessed, letting the cycle close via the cache in get_block.
         if self._scanning_index is not None:
-            # While scanning for cycles we only record which indexes each block references;
-            # the returned reference is a dummy that is never resolved.
+            # In scanning mode we only record reference edges; return a dummy reference
+            # that is never resolved.
             self._reference_edges[self._scanning_index].append(index)
-            return lambda: None
-        return lambda: self.get_block(index)
+            return BlockReference(lambda: None)
+        return BlockReference(lambda: self.get_block(index))
 
     def get_block_class(self, path):
         try:
@@ -105,7 +107,9 @@ class BlockDefinitionLookup:
         return index in self._cyclic_block_indexes
 
     def _block_has_cycle(self, index, path):
-        # True if following reference edges from `index` can reach `index` again.
+        # DFS with ancestor tracking: `path` is the set of indexes on the current
+        # stack. If a child index is already in `path` we have found a back-edge,
+        # i.e. a cycle that passes through `index`.
         if index in path:
             return True
 
@@ -125,7 +129,9 @@ class BlockDefinitionLookupBuilder:
         self.blocks = []
 
         # Index of each block we have fully added, keyed by id(block), so the same block
-        # instance re-used in several places is only stored once.
+        # instance re-used in several places is only stored once. Using id() is safe here
+        # because all block instances are kept alive by their parent blocks for the entire
+        # lifetime of the builder, so id values cannot be reused.
         self.block_indexes_by_identity = {}
 
         # Blocks whose deconstruction is in progress, keyed by id(block). The value is the

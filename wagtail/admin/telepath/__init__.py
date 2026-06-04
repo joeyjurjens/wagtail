@@ -1,6 +1,5 @@
-import telepath as _telepath
 from django import forms
-from telepath import Adapter, AdapterRegistry, JSContextBase
+from telepath import Adapter, AdapterRegistry, JSContextBase, ValueContext
 
 
 class CyclePlaceholder:
@@ -19,7 +18,7 @@ class CyclePlaceholder:
         return {"_ref": self.id}
 
 
-class WagtailValueContext(_telepath.ValueContext):
+class WagtailValueContext(ValueContext):
     """
     Backport of: https://github.com/wagtail/telepath/pull/15
 

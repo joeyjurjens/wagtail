@@ -70,28 +70,6 @@ class TestBlock(SimpleTestCase):
         block = blocks.Block()
         self.assertIs(blocks.Block.definition_registry[block.definition_prefix], block)
 
-    def test_declarative_subblocks_use_blockdict(self):
-        class ExampleBlock(blocks.StructBlock):
-            title = blocks.CharBlock()
-
-        self.assertIsInstance(ExampleBlock.declared_blocks, BlockDict)
-        self.assertIsInstance(ExampleBlock.base_blocks, BlockDict)
-
-    def test_blockdict_copy_preserves_unresolved_references(self):
-        def child_ref():
-            return blocks.CharBlock
-
-        child_blocks = BlockDict([("child", child_ref)])
-
-        copied_child_blocks = child_blocks.copy()
-
-        self.assertTrue(
-            blocks.Block.is_reference(
-                collections.OrderedDict.__getitem__(copied_child_blocks, "child")
-            )
-        )
-        self.assertIs(copied_child_blocks["child"].__class__, blocks.CharBlock)
-
     def test_block_is_previewable(self):
         class CustomContextBlock(blocks.Block):
             def get_preview_context(self, value, parent_context=None):
@@ -6485,27 +6463,15 @@ class TestSystemCheck(TestCase):
         self.assertEqual(errors[1].hint, "Block names cannot contain spaces")
         self.assertEqual(errors[1].obj, failing_block_2)
 
-    def test_system_checks_terminate_on_cyclic_blocks(self):
-        class CommentBlock(blocks.StructBlock):
-            title = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
-
-        self.assertEqual(CommentBlock().check(), [])
-
 
 class TestCyclicBlockTraversal(SimpleTestCase):
     def test_clean_deferred_terminates_on_cyclic_blocks(self):
         class CommentBlock(blocks.StructBlock):
             title = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         block = CommentBlock()
-        value = block._to_struct_value(
-            [
-                ("title", ""),
-                ("replies", block.child_blocks["replies"].empty_value()),
-            ]
-        )
+        value = block.to_python({"title": "", "replies": []})
 
         clean_value = block.clean_deferred(value)
 
@@ -6574,6 +6540,46 @@ class TestCyclicBlockTraversal(SimpleTestCase):
 
         CustomStruct().restore_deferred_validation()
         self.assertEqual(calls, ["custom"])
+
+    def test_guard_auto_applied_to_custom_check(self):
+        # A user-defined block that overrides check() and calls super() must not
+        # have the guard applied twice. If it were, super().check() would be cut
+        # short by the guard before iterating child blocks, and child.check()
+        # would never be called.
+        calls = []
+
+        class TrackingCharBlock(blocks.CharBlock):
+            def check(self, **kwargs):
+                calls.append("child")
+                return super().check(**kwargs)
+
+        class CustomStruct(blocks.StructBlock):
+            name = TrackingCharBlock()
+
+            def check(self, **kwargs):
+                calls.append("check")
+                return super().check(**kwargs)
+
+        errors = CustomStruct().check()
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, ["check", "child"])
+
+    def test_overridden_check_calling_super_terminates_on_cycle(self):
+        # A custom check() that calls super() terminates on a cyclic graph because
+        # the guard on the parent (StructBlock) catches the re-entry.
+        calls = []
+
+        class CommentBlock(blocks.StructBlock):
+            text = blocks.CharBlock()
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
+
+            def check(self, **kwargs):
+                calls.append("check")
+                return super().check(**kwargs)
+
+        errors = CommentBlock().check()
+        self.assertEqual(errors, [])
+        self.assertIn("check", calls)
 
 
 class TestTemplateRendering(TestCase):
@@ -7247,7 +7253,7 @@ class TestBlockDefinitionLookup(TestCase):
     def test_cyclic_listblock_lookup_round_trip(self):
         class CommentBlock(blocks.StructBlock):
             title = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         original = CommentBlock()
         builder = BlockDefinitionLookupBuilder()
@@ -7262,10 +7268,10 @@ class TestBlockDefinitionLookup(TestCase):
 
     def test_mutual_cyclic_lookup_round_trip(self):
         class AuthorBlock(blocks.StructBlock):
-            posts = blocks.ListBlock(lambda: PostBlock)
+            posts = blocks.ListBlock(blocks.BlockReference(lambda: PostBlock))
 
         class PostBlock(blocks.StructBlock):
-            authors = blocks.ListBlock(lambda: AuthorBlock)
+            authors = blocks.ListBlock(blocks.BlockReference(lambda: AuthorBlock))
 
         original = AuthorBlock()
         builder = BlockDefinitionLookupBuilder()
@@ -7304,7 +7310,7 @@ class TestBlockDefinitionLookup(TestCase):
         # again should produce a valid lookup table a second time.
         class CommentBlock(blocks.StructBlock):
             text = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         builder = BlockDefinitionLookupBuilder()
         index = builder.add_block(CommentBlock())
@@ -7318,6 +7324,12 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertIsInstance(rebuilt2, blocks.StructBlock)
         self.assertIs(rebuilt2.child_blocks["replies"].child_block, rebuilt2)
         self.assertEqual(rebuilt2.check(), [])
+
+    def test_get_block_reference_returns_block_reference(self):
+        lookup = BlockDefinitionLookup({0: ("wagtail.blocks.CharBlock", [], {})})
+        ref = lookup.get_block_reference(0)
+        self.assertIsInstance(ref, blocks.BlockReference)
+        self.assertIsInstance(ref.resolve(), blocks.CharBlock)
 
 
 class TestBlockDict(SimpleTestCase):
@@ -7338,20 +7350,14 @@ class TestBlockDict(SimpleTestCase):
         bd["a"] = block_a
         self.assertIn(("a", block_a), list(view))
 
-    def test_values_isinstance_valuesview(self):
-        self.assertIsInstance(BlockDict().values(), collections.abc.ValuesView)
-
-    def test_items_isinstance_itemsview(self):
-        self.assertIsInstance(BlockDict().items(), collections.abc.ItemsView)
-
     def test_values_resolves_references(self):
-        bd = BlockDict([("para", lambda: blocks.CharBlock)])
+        bd = BlockDict([("para", blocks.BlockReference(lambda: blocks.CharBlock))])
         values = list(bd.values())
         self.assertEqual(len(values), 1)
         self.assertIsInstance(values[0], blocks.CharBlock)
 
     def test_items_resolves_references(self):
-        bd = BlockDict([("para", lambda: blocks.CharBlock)])
+        bd = BlockDict([("para", blocks.BlockReference(lambda: blocks.CharBlock))])
         items = list(bd.items())
         self.assertEqual(len(items), 1)
         key, value = items[0]
@@ -7359,22 +7365,62 @@ class TestBlockDict(SimpleTestCase):
         self.assertIsInstance(value, blocks.CharBlock)
 
     def test_get_resolves_reference(self):
-        bd = BlockDict([("para", lambda: blocks.CharBlock)])
+        bd = BlockDict([("para", blocks.BlockReference(lambda: blocks.CharBlock))])
         self.assertIsInstance(bd.get("para"), blocks.CharBlock)
         self.assertIsNone(bd.get("missing"))
 
     def test_reference_memoised_after_first_access(self):
-        bd = BlockDict([("para", lambda: blocks.CharBlock)])
+        bd = BlockDict([("para", blocks.BlockReference(lambda: blocks.CharBlock))])
         first = bd["para"]
         second = bd["para"]
         self.assertIs(first, second)
+
+    def test_update_does_not_trigger_resolution(self):
+        # BlockDict.update() must copy raw values without calling __getitem__,
+        # so a BlockReference targeting a not-yet-defined class does not raise.
+        resolved = []
+
+        def ref():
+            resolved.append(True)
+            return blocks.CharBlock
+
+        source = BlockDict([("child", blocks.BlockReference(ref))])
+        dest = BlockDict()
+        dest.update(source)
+
+        self.assertEqual(resolved, [])  # ref() was never called
+        self.assertIsInstance(
+            collections.OrderedDict.__getitem__(dest, "child"),
+            blocks.BlockReference,
+        )
+
+    def test_copy_preserves_unresolved_references(self):
+        # copy() must not trigger resolution — a BlockReference targeting a
+        # not-yet-defined class must survive the copy unchanged.
+        ref = blocks.BlockReference(lambda: blocks.CharBlock)
+        child_blocks = BlockDict([("child", ref)])
+
+        copied = child_blocks.copy()
+
+        self.assertIsInstance(
+            collections.OrderedDict.__getitem__(copied, "child"),
+            blocks.BlockReference,
+        )
+        self.assertIsInstance(copied["child"], blocks.CharBlock)
+
+    def test_metaclass_uses_blockdict_for_base_blocks(self):
+        class ExampleBlock(blocks.StructBlock):
+            title = blocks.CharBlock()
+
+        self.assertIsInstance(ExampleBlock.declared_blocks, BlockDict)
+        self.assertIsInstance(ExampleBlock.base_blocks, BlockDict)
 
 
 class TestBlockReference(SimpleTestCase):
     def test_callable_reference_in_struct_block(self):
         class CommentBlock(blocks.StructBlock):
             text = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         block = CommentBlock()
         replies = block.child_blocks["replies"]
@@ -7387,49 +7433,60 @@ class TestBlockReference(SimpleTestCase):
         class TreeBlock(blocks.StreamBlock):
             pass
 
-        block = TreeBlock([("node", lambda: TreeBlock)])
+        block = TreeBlock([("node", blocks.BlockReference(lambda: TreeBlock))])
         self.assertIsInstance(block.child_blocks["node"], blocks.StreamBlock)
 
     def test_dotted_path_reference_resolves(self):
-        block = blocks.StructBlock([("text", "wagtail.blocks.CharBlock")])
+        block = blocks.StructBlock(
+            [("text", blocks.BlockReference("wagtail.blocks.CharBlock"))]
+        )
         self.assertIsInstance(block.child_blocks["text"], blocks.CharBlock)
 
     def test_callable_returning_instance_preserves_kwargs(self):
-        # A callable that returns a ready-made instance is used as-is; its
-        # own constructor arguments are not lost by re-instantiation.
-        block = blocks.StructBlock([("text", lambda: blocks.CharBlock(required=False))])
+        block = blocks.StructBlock(
+            [("text", blocks.BlockReference(lambda: blocks.CharBlock(required=False)))]
+        )
         self.assertFalse(block.child_blocks["text"].required)
 
-    def test_is_reference_true_for_callable(self):
-        self.assertTrue(blocks.Block.is_reference(lambda: blocks.CharBlock))
-
-    def test_is_reference_true_for_string(self):
-        self.assertTrue(blocks.Block.is_reference("wagtail.blocks.CharBlock"))
-
-    def test_is_reference_false_for_block_instance(self):
-        self.assertFalse(blocks.Block.is_reference(blocks.CharBlock()))
-
-    def test_resolve_reference_callable(self):
-        result = blocks.Block.resolve_reference(lambda: blocks.CharBlock)
+    def test_blockref_resolves_callable(self):
+        result = blocks.BlockReference(lambda: blocks.CharBlock).resolve()
         self.assertIsInstance(result, blocks.CharBlock)
 
-    def test_resolve_reference_string(self):
-        result = blocks.Block.resolve_reference("wagtail.blocks.CharBlock")
+    def test_blockref_resolves_string(self):
+        result = blocks.BlockReference("wagtail.blocks.CharBlock").resolve()
         self.assertIsInstance(result, blocks.CharBlock)
+
+    def test_resolve_memoizes(self):
+        ref = blocks.BlockReference(lambda: blocks.CharBlock)
+        first = ref.resolve()
+        second = ref.resolve()
+        self.assertIs(first, second)
+
+    def test_is_not_block_instance(self):
+        ref = blocks.BlockReference(lambda: blocks.CharBlock)
+        self.assertNotIsInstance(ref, blocks.Block)
+
+    def test_invalid_ref_raises(self):
+        ref = blocks.BlockReference(42)
+        with self.assertRaises(TypeError):
+            ref.resolve()
+
+    def test_class_level_declaration_in_metaclass(self):
+        class MyBlock(blocks.StructBlock):
+            title = blocks.CharBlock()
+            nested = blocks.BlockReference(lambda: MyBlock)
+
+        self.assertIn("nested", MyBlock.base_blocks)
+        self.assertIsInstance(MyBlock.base_blocks["nested"], blocks.StructBlock)
 
     def test_set_name_on_reference_deferred_to_resolution(self):
-        # set_name on a reference (stored in child_blocks before resolution)
-        # must not force resolution — the block is named when first accessed.
-        block = blocks.StructBlock([("child", lambda: blocks.CharBlock)])
-        # Access to force resolution and naming.
+        block = blocks.StructBlock(
+            [("child", blocks.BlockReference(lambda: blocks.CharBlock))]
+        )
         child = block.child_blocks["child"]
         self.assertEqual(child.name, "child")
 
     def test_forward_reference(self):
-        # A callable allows referencing a class that doesn't exist yet at
-        # definition time. AccordionBlock references ContentBlock which is
-        # defined afterwards; the lambda closes over the name, so by the time
-        # it's resolved ContentBlock exists.
         class AccordionBlock(blocks.StructBlock):
             heading = blocks.CharBlock()
 
@@ -7437,8 +7494,9 @@ class TestBlockReference(SimpleTestCase):
             accordion = AccordionBlock()
             paragraph = blocks.RichTextBlock()
 
-        # Wire the forward reference via constructor after ContentBlock exists.
-        accordion = AccordionBlock([("content", lambda: ContentBlock)])
+        accordion = AccordionBlock(
+            [("content", blocks.BlockReference(lambda: ContentBlock))]
+        )
         resolved = accordion.child_blocks["content"]
         self.assertIsInstance(resolved, blocks.StreamBlock)
         self.assertIn("accordion", resolved.child_blocks)
@@ -7448,7 +7506,7 @@ class TestCyclicBlockBehaviour(SimpleTestCase):
     def setUp(self):
         class CommentBlock(blocks.StructBlock):
             text = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         self.CommentBlock = CommentBlock
 
@@ -7458,11 +7516,11 @@ class TestCyclicBlockBehaviour(SimpleTestCase):
     def test_check_terminates_on_mutual_reference(self):
         class AuthorBlock(blocks.StructBlock):
             name = blocks.CharBlock()
-            posts = blocks.ListBlock(lambda: PostBlock)
+            posts = blocks.ListBlock(blocks.BlockReference(lambda: PostBlock))
 
         class PostBlock(blocks.StructBlock):
             title = blocks.CharBlock()
-            authors = blocks.ListBlock(lambda: AuthorBlock)
+            authors = blocks.ListBlock(blocks.BlockReference(lambda: AuthorBlock))
 
         self.assertEqual(AuthorBlock().check(), [])
 
@@ -7474,11 +7532,11 @@ class TestCyclicBlockBehaviour(SimpleTestCase):
     def test_get_default_terminates_on_mutual_reference(self):
         class AccordionBlock(blocks.StructBlock):
             heading = blocks.CharBlock()
-            content = blocks.ListBlock(lambda: ItemBlock)
+            content = blocks.ListBlock(blocks.BlockReference(lambda: ItemBlock))
 
         class ItemBlock(blocks.StructBlock):
             body = blocks.CharBlock()
-            nested = blocks.ListBlock(lambda: AccordionBlock)
+            nested = blocks.ListBlock(blocks.BlockReference(lambda: AccordionBlock))
 
         default = AccordionBlock().get_default()
         self.assertIn("heading", default)
@@ -7519,11 +7577,11 @@ class TestCyclicBlockBehaviour(SimpleTestCase):
         # required flag restored after clean_deferred, not left as False.
         class AccordionBlock(blocks.StructBlock):
             heading = blocks.CharBlock()
-            items = blocks.ListBlock(lambda: ItemBlock)
+            items = blocks.ListBlock(blocks.BlockReference(lambda: ItemBlock))
 
         class ItemBlock(blocks.StructBlock):
             title = blocks.CharBlock()
-            nested = blocks.ListBlock(lambda: AccordionBlock)
+            nested = blocks.ListBlock(blocks.BlockReference(lambda: AccordionBlock))
 
         block = AccordionBlock()
         value = block.to_python({"heading": "", "items": []})
@@ -7545,7 +7603,7 @@ class TestCyclicBlockTelepath(SimpleTestCase):
     def test_self_referential_pack_terminates(self):
         class CommentBlock(blocks.StructBlock):
             text = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
         block = CommentBlock()
         block.set_name("comment")
@@ -7555,11 +7613,11 @@ class TestCyclicBlockTelepath(SimpleTestCase):
     def test_mutual_reference_pack_terminates(self):
         class AccordionBlock(blocks.StructBlock):
             heading = blocks.CharBlock()
-            items = blocks.ListBlock(lambda: ItemBlock)
+            items = blocks.ListBlock(blocks.BlockReference(lambda: ItemBlock))
 
         class ItemBlock(blocks.StructBlock):
             body = blocks.CharBlock()
-            nested = blocks.ListBlock(lambda: AccordionBlock)
+            nested = blocks.ListBlock(blocks.BlockReference(lambda: AccordionBlock))
 
         packed = JSContext().pack(AccordionBlock())
         self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
@@ -7569,8 +7627,10 @@ class TestCyclicBlockTelepath(SimpleTestCase):
         # packed output so the JS side can close the cycle.
         class CommentBlock(blocks.StructBlock):
             text = blocks.CharBlock()
-            replies = blocks.ListBlock(lambda: CommentBlock)
+            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
 
-        packed_json = json.dumps(JSContext().pack(CommentBlock()), cls=DjangoJSONEncoder)
+        packed_json = json.dumps(
+            JSContext().pack(CommentBlock()), cls=DjangoJSONEncoder
+        )
         self.assertIn("_id", packed_json)
         self.assertIn("_ref", packed_json)
