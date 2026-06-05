@@ -178,13 +178,11 @@ class ListBlock(Block):
     def construct_from_lookup(cls, lookup, *args, **kwargs):
         if getattr(cls.__init__, "has_child_block_arg", False):
             if args and isinstance(args[0], int):
-                args = (lookup.get_block_reference(args[0]), *args[1:])
+                args = (lookup.get_block(args[0]), *args[1:])
             else:
                 child_block_kwarg = kwargs.get("child_block")
                 if isinstance(child_block_kwarg, int):
-                    kwargs["child_block"] = lookup.get_block_reference(
-                        child_block_kwarg
-                    )
+                    kwargs["child_block"] = lookup.get_block(child_block_kwarg)
 
         return cls(*args, **kwargs)
 

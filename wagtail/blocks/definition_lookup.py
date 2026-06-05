@@ -37,87 +37,38 @@ class BlockDefinitionLookup:
     def __init__(self, blocks):
         self.blocks = blocks
         self.block_classes = {}
-        self.block_instances = {}
-        self._cyclic_block_indexes = None
-        self._reference_edges = None
-        # While not None, get_block_reference records edges into _reference_edges instead
-        # of returning a real reference (used by _build_reference_edges).
-        self._scanning_index = None
+        self._instances = {}
+        self._building = set()
+        self._cycle_participants = set()
 
     def get_block(self, index):
-        # A block that takes part in a cycle is built once and cached, so the cycle closes
-        # onto a single shared instance instead of reconstructing forever. Non-cyclic
-        # blocks are built fresh each time, as before.
-        if self.is_cyclic_block(index):
-            try:
-                return self.block_instances[index]
-            except KeyError:
-                pass
+        # Return a cached instance — only cyclic blocks are cached.
+        if index in self._instances:
+            return self._instances[index]
 
+        # We're already building this index — a cycle. Return a lazy BlockReference
+        # so construction can complete; it resolves to the finished instance later.
+        if index in self._building:
+            self._cycle_participants.add(index)
+            return BlockReference(lambda i=index: self._instances[i])
+
+        self._building.add(index)
         path, args, kwargs = self.blocks[index]
-        cls = self.get_block_class(path)
-        block = cls.construct_from_lookup(self, *args, **kwargs)
-        if self.is_cyclic_block(index):
-            self.block_instances[index] = block
-
-        return block
-
-    def get_block_reference(self, index):
-        # Returns a BlockReference that resolves to the block at `index` on first access.
-        # Container blocks use this instead of get_block() so that cyclic entries are only
-        # built when first accessed, letting the cycle close via the cache in get_block.
-        if self._scanning_index is not None:
-            # In scanning mode we only record reference edges; return a dummy reference
-            # that is never resolved.
-            self._reference_edges[self._scanning_index].append(index)
-            return BlockReference(lambda: None)
-        return BlockReference(lambda: self.get_block(index))
-
-    def get_block_class(self, path):
         try:
-            return self.block_classes[path]
+            cls = self.block_classes[path]
         except KeyError:
             module_name, class_name = path.rsplit(".", 1)
             module = import_module(module_name)
             cls = self.block_classes[path] = getattr(module, class_name)
-            return cls
+        block = cls.construct_from_lookup(self, *args, **kwargs)
+        self._building.discard(index)
 
-    def _build_reference_edges(self):
-        # Discover which indexes each lookup entry references, by constructing each entry
-        # once and recording the get_block_reference() calls its construct_from_lookup
-        # makes. This means no block needs to declare its references separately —
-        # construct_from_lookup is the single source of truth for the reference structure.
-        self._reference_edges = {index: [] for index in self.blocks}
-        for index in self.blocks:
-            self._scanning_index = index
-            path, args, kwargs = self.blocks[index]
-            self.get_block_class(path).construct_from_lookup(self, *args, **kwargs)
-        self._scanning_index = None
+        # Cache only blocks that took part in a cycle, so the BlockReference above
+        # can close onto a single shared instance.
+        if index in self._cycle_participants:
+            self._instances[index] = block
 
-    def is_cyclic_block(self, index):
-        # Which lookup entries take part in a cycle, computed once (lazily) by a DFS over
-        # the reference edges discovered above. For a normal acyclic lookup this finds
-        # nothing and get_block behaves exactly as before.
-        if self._cyclic_block_indexes is None:
-            if self._reference_edges is None:
-                self._build_reference_edges()
-            self._cyclic_block_indexes = {
-                index for index in self.blocks if self._block_has_cycle(index, set())
-            }
-        return index in self._cyclic_block_indexes
-
-    def _block_has_cycle(self, index, path):
-        # DFS with ancestor tracking: `path` is the set of indexes on the current
-        # stack. If a child index is already in `path` we have found a back-edge,
-        # i.e. a cycle that passes through `index`.
-        if index in path:
-            return True
-
-        path = path | {index}
-        for child_index in self._reference_edges[index]:
-            if self._block_has_cycle(child_index, path):
-                return True
-        return False
+        return block
 
 
 class BlockDefinitionLookupBuilder:

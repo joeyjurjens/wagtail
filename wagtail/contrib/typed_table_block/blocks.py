@@ -95,8 +95,7 @@ class BaseTypedTableBlock(Block):
     def construct_from_lookup(cls, lookup, child_blocks, **kwargs):
         if child_blocks:
             child_blocks = [
-                (name, lookup.get_block_reference(index))
-                for name, index in child_blocks
+                (name, lookup.get_block(index)) for name, index in child_blocks
             ]
         return cls(child_blocks, **kwargs)
 

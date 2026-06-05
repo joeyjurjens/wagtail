@@ -7325,12 +7325,6 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertIs(rebuilt2.child_blocks["replies"].child_block, rebuilt2)
         self.assertEqual(rebuilt2.check(), [])
 
-    def test_get_block_reference_returns_block_reference(self):
-        lookup = BlockDefinitionLookup({0: ("wagtail.blocks.CharBlock", [], {})})
-        ref = lookup.get_block_reference(0)
-        self.assertIsInstance(ref, blocks.BlockReference)
-        self.assertIsInstance(ref.resolve(), blocks.CharBlock)
-
 
 class TestBlockDict(SimpleTestCase):
     def test_values_is_live_view(self):
