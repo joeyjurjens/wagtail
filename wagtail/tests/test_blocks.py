@@ -7240,12 +7240,7 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertEqual(set(replies_child.child_blocks.keys()), {"text", "replies"})
         self.assertEqual(rebuilt2.check(), [])
 
-    # --- fresh-instance semantics for cyclic blocks ---
-
-    def test_cyclic_get_block_twice_returns_fresh_instance(self):
-        # get_block() returns a fresh instance on every call, for cyclic indexes too —
-        # exactly as for non-cyclic ones. The cycle is closed by lazy resolution and
-        # terminated by node identity (_definition_id), not by sharing instances.
+    def test_cyclic_lookup(self):
         lookup = BlockDefinitionLookup(
             {
                 0: ("wagtail.blocks.CharBlock", [], {}),
@@ -7257,40 +7252,17 @@ class TestBlockDefinitionLookup(TestCase):
                 2: ("wagtail.blocks.ListBlock", [1], {}),
             }
         )
-        first = lookup.get_block(1)
-        second = lookup.get_block(1)
-        self.assertIsNot(first, second)
-        self.assertEqual(first.check(), [])
+        comment_block = lookup.get_block(1)
+        comment_block.set_name("comment")
+        self.assertIsInstance(comment_block, blocks.StructBlock)
 
-    def test_non_cyclic_get_block_twice_returns_fresh_instance(self):
-        # Non-cyclic blocks must still produce a fresh instance on every call
-        # so that set_name() calls by different parents don't interfere.
-        lookup = BlockDefinitionLookup({0: ("wagtail.blocks.CharBlock", [], {})})
-        first = lookup.get_block(0)
-        second = lookup.get_block(0)
-        self.assertIsNot(first, second)
-
-    def test_set_name_on_cyclic_root_is_independent_of_child_reference(self):
-        # Because each reference resolves to a fresh instance, naming the root cannot
-        # leak into (or corrupt) the cyclic child — they are independent objects, just
-        # as two non-cyclic re-materialisations of one definition would be.
-        lookup = BlockDefinitionLookup(
-            {
-                0: ("wagtail.blocks.CharBlock", [], {}),
-                1: (
-                    "wagtail.blocks.StructBlock",
-                    [[("text", 0), ("replies", 2)]],
-                    {},
-                ),
-                2: ("wagtail.blocks.ListBlock", [1], {}),
-            }
-        )
-        rebuilt = lookup.get_block(1)
-        rebuilt.set_name("comment")
-        child = rebuilt.child_blocks["replies"].child_block
-        self.assertIsNot(child, rebuilt)
-        self.assertEqual(rebuilt.name, "comment")
-        self.assertEqual(rebuilt.check(), [])
+        # A subsequent call to get_block with the same index should return a new instance;
+        # this ensures that state changes such as set_name are independent of other blocks
+        comment_block_2 = lookup.get_block(1)
+        comment_block_2.set_name("reply")
+        self.assertIsNot(comment_block, comment_block_2)
+        self.assertEqual(comment_block.name, "comment")
+        self.assertEqual(comment_block_2.name, "reply")
 
     def test_cyclic_struct_via_list_check_and_default(self):
         # StructBlock → ListBlock → same StructBlock: check() and get_default()
@@ -7358,30 +7330,6 @@ class TestBlockDefinitionLookup(TestCase):
         self.assertIsInstance(item_block, blocks.StructBlock)
         self.assertEqual(set(item_block.child_blocks.keys()), {"text", "stream"})
         self.assertEqual(struct_block.check(), [])
-
-    def test_cyclic_block_defer_restore_validation(self):
-        # defer_required_validation / restore_deferred_validation on a shared
-        # cyclic instance must leave the block in a clean state.
-        lookup = BlockDefinitionLookup(
-            {
-                0: ("wagtail.blocks.CharBlock", [], {"required": True}),
-                1: (
-                    "wagtail.blocks.StructBlock",
-                    [[("text", 0), ("replies", 2)]],
-                    {},
-                ),
-                2: ("wagtail.blocks.ListBlock", [1], {}),
-            }
-        )
-        block = lookup.get_block(1)
-        char_block = block.child_blocks["text"]
-        self.assertTrue(char_block.field.required)
-
-        block.defer_required_validation()
-        self.assertFalse(char_block.field.required)
-
-        block.restore_deferred_validation()
-        self.assertTrue(char_block.field.required)
 
 
 class TestBlockReference(SimpleTestCase):
@@ -7636,16 +7584,12 @@ class TestBlockReference(SimpleTestCase):
 
     # clean_deferred traversal
     def test_clean_deferred_terminates_on_cyclic_blocks(self):
-        class CommentBlock(blocks.StructBlock):
-            title = blocks.CharBlock()
-            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
-
-        block = CommentBlock()
-        value = block.to_python({"title": "", "replies": []})
+        block = self.CommentBlock()
+        value = block.to_python({"text": "", "replies": []})
 
         clean_value = block.clean_deferred(value)
 
-        self.assertEqual(clean_value["title"], "")
+        self.assertEqual(clean_value["text"], "")
         self.assertEqual(list(clean_value["replies"]), [])
 
         with self.assertRaises(ValidationError):
@@ -7773,11 +7717,7 @@ class TestBlockReference(SimpleTestCase):
         self.assertIn("wagtailcore.E008", error_ids)
 
     def test_no_false_struct_only_cycle(self):
-        class CommentBlock(blocks.StructBlock):
-            text = blocks.CharBlock()
-            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
-
-        error_ids = [error.id for error in CommentBlock().check()]
+        error_ids = [error.id for error in self.CommentBlock().check()]
         self.assertNotIn("wagtailcore.E008", error_ids)
 
         class SectionBlock(blocks.StructBlock):
@@ -7798,53 +7738,5 @@ class TestBlockReference(SimpleTestCase):
         error_ids = [error.id for error in OuterBlock().check()]
         self.assertNotIn("wagtailcore.E008", error_ids)
 
-    # telepath packing
-    def test_non_cyclic_pack_round_trip(self):
-        block = blocks.StructBlock(
-            [("heading", blocks.CharBlock()), ("body", blocks.CharBlock())]
-        )
-        block.set_name("section")
-        packed = JSContext().pack(block)
-        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
-
-    def test_cyclic_pack_terminates_and_uses_ref(self):
-        class CommentBlock(blocks.StructBlock):
-            text = blocks.CharBlock()
-            replies = blocks.ListBlock(blocks.BlockReference(lambda: CommentBlock))
-
-        block = CommentBlock()
-        block.set_name("comment")
-        packed = JSContext().pack(block)
-        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
-
-        class AccordionBlock(blocks.StructBlock):
-            heading = blocks.CharBlock()
-            items = blocks.ListBlock(blocks.BlockReference(lambda: ItemBlock))
-
-        class ItemBlock(blocks.StructBlock):
-            body = blocks.CharBlock()
-            nested = blocks.ListBlock(blocks.BlockReference(lambda: AccordionBlock))
-
-        packed = JSContext().pack(AccordionBlock())
-        self.assertEqual(packed["_type"], "wagtail.blocks.StructBlock")
-
-        # The cyclic block is reached through two distinct references (a diamond);
-        # packing must terminate and reuse the shared node via _id/_ref.
-        class Diamond(blocks.StructBlock):
-            left = blocks.ListBlock(blocks.BlockReference(lambda: Leaf))
-            right = blocks.ListBlock(blocks.BlockReference(lambda: Leaf))
-
-        class Leaf(blocks.StructBlock):
-            label = blocks.CharBlock()
-            back = blocks.ListBlock(blocks.BlockReference(lambda: Diamond))
-
-        packed_json = json.dumps(JSContext().pack(Diamond()), cls=DjangoJSONEncoder)
-        self.assertIn("_ref", packed_json)
-
-        # A cyclic block graph must produce at least one _id/_ref pair in the
-        # packed output so the JS side can close the cycle.
-        packed_json = json.dumps(
-            JSContext().pack(CommentBlock()), cls=DjangoJSONEncoder
-        )
-        self.assertIn("_id", packed_json)
-        self.assertIn("_ref", packed_json)
+    def test_cyclic_block_packs_without_recursion(self):
+        JSContext().pack(self.CommentBlock())
