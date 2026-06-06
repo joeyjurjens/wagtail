@@ -739,83 +739,69 @@ class BlockDict(collections.OrderedDict):
         return self[key] if key in self else default
 
 
-@contextmanager
-def track_reentry(var, key, *, visit_once):
+class CycleGuard:
     """
-    Track ``key`` in an ambient (ContextVar) set for the duration of the outermost
-    enclosing call, yielding ``True`` if ``key`` is already present (re-entry) or
-    ``False`` on first sight.
+    Re-entry tracker for one operation that walks the block-definition graph. Keyed by
+    node identity (``Block._definition_id``, so fresh re-materialisations of one node —
+    e.g. rebuilt from a migration lookup — are recognised even though their ``id()``
+    differs). The set of in-progress keys lives in a ContextVar, so a block reached
+    recursively shares the walk with its ancestors.
 
-    This is the shared bookkeeping for cycle detection on a block-definition graph,
-    where ``key`` is derived from ``Block._definition_id`` (so fresh re-materialisations
-    of one node are recognised). Two callers need slightly different membership scope:
-
-    - ``visit_once=True`` keeps the key for the whole walk, so each node is handled
-      exactly once even when reached by several paths (used by full-graph methods like
-      ``check``).
-    - ``visit_once=False`` removes the key once this call returns, so only keys on the
-      current recursion stack short-circuit (used for coinductive equality).
+    ``visit_once=True`` keeps each key for the whole walk, so a node is handled once
+    even when reached by several paths (full-graph methods such as ``check``).
+    ``visit_once=False`` drops the key when the call returns, so only keys on the
+    current recursion stack short-circuit (coinductive equality).
     """
-    seen = var.get()
-    token = None
-    if seen is None:
-        seen = set()
-        token = var.set(seen)
-    try:
-        if key in seen:
-            yield True
-        else:
-            seen.add(key)
-            try:
-                yield False
-            finally:
-                if not visit_once:
-                    seen.discard(key)
-    finally:
-        if token is not None:
-            var.reset(token)
+
+    def __init__(self, name, *, visit_once):
+        self._var = ContextVar("block_cycle_%s" % name, default=None)
+        self._visit_once = visit_once
+
+    @contextmanager
+    def entered(self, key):
+        seen = self._var.get()
+        token = None
+        if seen is None:
+            seen = set()
+            token = self._var.set(seen)
+        try:
+            if key in seen:
+                yield True
+            else:
+                seen.add(key)
+                try:
+                    yield False
+                finally:
+                    if not self._visit_once:
+                        seen.discard(key)
+        finally:
+            if token is not None:
+                self._var.reset(token)
 
 
-# One walk-state ContextVar per guarded *operation* (keyed by method name), created on
-# demand when the decorator is applied. All blocks' `check` implementations share one
-# walk-state; `defer_required_validation` has its own; etc. — so two different full-graph
-# operations never share a visited-set, even if one is ever called within another.
-_full_graph_walk_vars = {}
+# One guard per full-graph operation (check, defer_required_validation, ...), created on
+# demand. Methods that walk the stored value rather than the definition are not guarded:
+# a cycle through a sequence block (ListBlock/StreamBlock) terminates via its empty default.
+_full_graph_guards = {}
 
 
 def guard_full_graph_method(on_reentry=None):
     """
-    Guard a method that walks the whole block-definition graph against infinite
-    recursion on a cyclic graph.
-
-    A per-operation visited-set (keyed by each block's node identity, see
-    ``Block._definition_id``) is kept for the duration of the outermost call;
-    re-entering a node that has already been visited returns ``on_reentry`` instead of
-    recursing. Methods that walk the stored value rather than the definition are not
-    guarded — a cycle that passes through a sequence block (ListBlock/StreamBlock)
-    terminates through that block's empty default.
-
-    Applied automatically by ``Block.__init_subclass__``; no need to add this decorator
-    manually.
+    Guard a method that walks the whole block-definition graph against infinite recursion
+    on a cyclic graph: re-entering an already-visited node returns ``on_reentry`` instead
+    of recursing. Applied automatically by ``Block.__init_subclass__``; no need to add
+    this decorator manually.
     """
 
     def decorator(method):
-        walk_var = _full_graph_walk_vars.setdefault(
-            method.__name__,
-            ContextVar("full_graph_walk_%s" % method.__name__, default=None),
+        guard = _full_graph_guards.setdefault(
+            method.__name__, CycleGuard(method.__name__, visit_once=True)
         )
 
         @wraps(method)
         def wrapped(self, *args, **kwargs):
-            # Key on node identity (_definition_id), not object identity: fresh
-            # re-materialisations of one cyclic node (rebuilt from a migration lookup)
-            # share a _definition_id even though their id() differs.
-            with track_reentry(
-                walk_var, self._definition_id, visit_once=True
-            ) as reentered:
-                if reentered:
-                    return on_reentry
-                return method(self, *args, **kwargs)
+            with guard.entered(self._definition_id) as reentered:
+                return on_reentry if reentered else method(self, *args, **kwargs)
 
         wrapped._is_guarded = True
         return wrapped
@@ -823,9 +809,9 @@ def guard_full_graph_method(on_reentry=None):
     return decorator
 
 
-# Node pairs currently being compared by BlockReference.__eq__, so that equality of a
-# cyclic block graph terminates instead of recursing through the reference forever.
-_reference_eq_in_progress = ContextVar("block_reference_eq", default=None)
+# Equality of a cyclic block graph compares coinductively: the (node, node) pairs
+# currently on the comparison stack short-circuit to "equal".
+reference_eq_guard = CycleGuard("reference_eq", visit_once=False)
 
 
 class BlockReference:
@@ -895,9 +881,7 @@ class BlockReference:
 
         resolved = self.resolve()
         pair = (resolved._definition_id, other._definition_id)
-        with track_reentry(
-            _reference_eq_in_progress, pair, visit_once=False
-        ) as reentered:
+        with reference_eq_guard.entered(pair) as reentered:
             return True if reentered else resolved == other
 
     # Defining __eq__ makes this unhashable by default, matching Block.
