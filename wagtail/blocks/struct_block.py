@@ -17,13 +17,13 @@ from wagtail.coreutils import safe_snake_case
 
 from .base import (
     Block,
-    BlockReference,
     BoundBlock,
     DeclarativeSubBlocksMetaclass,
     get_error_json_data,
     get_error_list_json_data,
     get_help_icon,
 )
+from .cyclic import BlockReference, has_struct_only_cycle
 
 __all__ = [
     "BlockGroup",
@@ -497,41 +497,18 @@ class BaseStructBlock(Block):
         return errors
 
     def _check_struct_only_cycle(self):
-        # A StructBlock builds its default by defaulting every child, so a cycle of
-        # nothing but StructBlocks has no finite default and could not be rendered. Any
-        # non-StructBlock on the path (a ListBlock, StreamBlock, etc.) has an empty
-        # default that breaks the cycle, so we walk StructBlock -> StructBlock edges only
-        # and report if we get back to self. This relies on StructBlock being the only
-        # block whose get_default() descends into its children, which holds for every
-        # built-in block; a custom block that overrides get_default() to descend would
-        # not be detected here.
-        start_id = self._definition_id
-
-        def reaches_start(block, visited_ids):
-            for child_block in block.child_blocks.values():
-                if not isinstance(child_block, BaseStructBlock):
-                    continue
-                child_id = child_block._definition_id
-                if child_id == start_id:
-                    return True
-                if child_id not in visited_ids and reaches_start(
-                    child_block, visited_ids | {child_id}
-                ):
-                    return True
-            return False
-
-        if reaches_start(self, frozenset()):
-            return [
-                checks.Error(
-                    f"{self.__class__.__name__} cannot contain itself through a chain "
-                    "of StructBlocks only, as it would have no finite default value and "
-                    "could not be rendered. Nest the recursive child in a ListBlock or "
-                    "StreamBlock instead.",
-                    obj=self,
-                    id="wagtailcore.E008",
-                )
-            ]
-        return []
+        if not has_struct_only_cycle(self):
+            return []
+        return [
+            checks.Error(
+                f"{self.__class__.__name__} cannot contain itself through a chain "
+                "of StructBlocks only, as it would have no finite default value and "
+                "could not be rendered. Nest the recursive child in a ListBlock or "
+                "StreamBlock instead.",
+                obj=self,
+                id="wagtailcore.E008",
+            )
+        ]
 
     def _check_form_layout(self):
         if self.meta.form_template and any(
