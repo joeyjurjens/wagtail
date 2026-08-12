@@ -2,6 +2,7 @@ from django.db.models import Model
 from django.utils.html import escape
 
 from wagtail.models import Page
+from wagtail.request_context import get_current_request, get_current_site
 from wagtail.rich_text import LinkHandler
 
 
@@ -27,8 +28,15 @@ class PageLinkHandler(LinkHandler):
 
     @classmethod
     def expand_db_attributes_many(cls, attrs_list: list[dict]) -> list[str]:
+        def get_url(page):
+            request = get_current_request()
+            site = get_current_site()
+            if request or site:
+                return page.get_url(request=request, current_site=site)
+            return page.localized.url
+
         return [
-            '<a href="%s">' % escape(page.localized.url) if page else "<a>"
+            '<a href="%s">' % escape(get_url(page)) if page else "<a>"
             for page in cls.get_many(attrs_list)
         ]
 
