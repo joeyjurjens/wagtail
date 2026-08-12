@@ -1816,6 +1816,7 @@ class StreamPage(Page):
                 ListBlock(CharBlock()),
             ),
             ("image_with_alt", ImageBlock()),
+            ("document", DocumentChooserBlock()),
         ],
     )
 

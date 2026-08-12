@@ -2,6 +2,7 @@ import collections
 import itertools
 import json
 import re
+from contextvars import ContextVar
 from functools import lru_cache
 from importlib import import_module
 
@@ -19,6 +20,10 @@ from wagtail.admin.staticfiles import versioned_static
 from wagtail.admin.telepath import JSContext
 from wagtail.admin.telepath import register as register_telepath_adapter
 from wagtail.utils.templates import template_is_overridden
+
+# Holds a {model_class: {pk: instance}} dict while a batched bulk_to_python or prefetch_stream_choosers call is in progress.
+_chooser_cache: ContextVar = ContextVar("wagtail_chooser_cache", default=None)
+
 
 __all__ = [
     "BaseBlock",
@@ -856,3 +861,54 @@ def get_error_list_json_data(error_list):
 DECONSTRUCT_ALIASES = {
     Block: "wagtail.blocks.Block",
 }
+
+
+def _collect_chooser_pks(block, values, pks_by_model):
+    """
+    Recursively walk raw block values and collect all chooser PKs into
+    pks_by_model ({model_class: set of PKs}) without hitting the database.
+
+    Alternative way would be adding a method like "collect_chooser_pks" on the block types.
+    """
+    from wagtail.blocks.field_block import ChooserBlock
+    from wagtail.blocks.list_block import ListBlock
+    from wagtail.blocks.stream_block import BaseStreamBlock
+    from wagtail.blocks.struct_block import BaseStructBlock
+
+    if isinstance(block, ChooserBlock):
+        pks_by_model.setdefault(block.model_class, set()).update(
+            v for v in values if v is not None
+        )
+    elif isinstance(block, BaseStreamBlock):
+        child_inputs = {}
+        for stream in values:
+            for block_dict in stream or []:
+                block_type = block_dict["type"]
+                if block_type in block.child_blocks:
+                    child_inputs.setdefault(block_type, []).append(block_dict["value"])
+        for block_type, child_values in child_inputs.items():
+            _collect_chooser_pks(
+                block.child_blocks[block_type], child_values, pks_by_model
+            )
+    elif isinstance(block, BaseStructBlock):
+        for name, child_block in block.child_blocks.items():
+            child_values = [v[name] for v in values if v and name in v]
+            if child_values:
+                _collect_chooser_pks(child_block, child_values, pks_by_model)
+    elif isinstance(block, ListBlock):
+        raw_values = []
+        for list_data in values:
+            for item in list_data or []:
+                # ListBlock stores items in new block format {id, type, value}
+                # or the old plain-value format; handle both.
+                if (
+                    isinstance(item, dict)
+                    and "id" in item
+                    and "value" in item
+                    and item.get("type") == "item"
+                ):
+                    raw_values.append(item["value"])
+                else:
+                    raw_values.append(item)
+        if raw_values:
+            _collect_chooser_pks(block.child_block, raw_values, pks_by_model)

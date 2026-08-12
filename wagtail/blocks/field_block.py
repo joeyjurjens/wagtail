@@ -25,7 +25,7 @@ from wagtail.rich_text import (
     get_text_for_indexing,
 )
 
-from .base import Block
+from .base import Block, _chooser_cache
 
 
 class FieldBlock(Block):
@@ -906,7 +906,12 @@ class ChooserBlock(FieldBlock):
         The instances must be returned in the same order as the values and keep None values.
         If the same ID appears multiple times, a distinct object instance is created for each one.
         """
-        objects = self.model_class.objects.in_bulk(values)
+        cache = _chooser_cache.get()
+        objects = (
+            cache.get(self.model_class, {})
+            if cache is not None
+            else self.model_class.objects.in_bulk(values)
+        )
         seen_ids = set()
         result = []
 

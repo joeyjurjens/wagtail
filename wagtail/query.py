@@ -2,6 +2,7 @@ import posixpath
 import warnings
 from collections import defaultdict
 from collections.abc import Iterable
+from itertools import islice
 from typing import Any
 
 from django.apps import apps
@@ -143,6 +144,9 @@ class SpecificQuerySetMixin:
         self._defer_streamfields = False
         self._specific_select_related_fields = ()
         self._specific_prefetch_related_lookups = ()
+        self._prefetch_streamfield_choosers = False
+        self._prefetch_streamfield_chooser_field_names = None
+        self._prefetch_streamfield_choosers_done = False
 
     def _clone(self):
         """Ensure clones inherit custom attribute values."""
@@ -151,6 +155,10 @@ class SpecificQuerySetMixin:
         clone._specific_select_related_fields = self._specific_select_related_fields
         clone._specific_prefetch_related_lookups = (
             self._specific_prefetch_related_lookups
+        )
+        clone._prefetch_streamfield_choosers = self._prefetch_streamfield_choosers
+        clone._prefetch_streamfield_chooser_field_names = (
+            self._prefetch_streamfield_chooser_field_names
         )
         return clone
 
@@ -585,6 +593,51 @@ class PageQuerySet(SearchableQuerySetMixin, SpecificQuerySetMixin, TreeQuerySet)
         """
         return self.exclude(self.translation_of_q(page, inclusive))
 
+    def prefetch_streamfield_choosers(self, field_names=None):
+        clone = self._chain()
+        clone._prefetch_streamfield_choosers = True
+        clone._prefetch_streamfield_chooser_field_names = field_names
+        return clone
+
+    def _prefetch_streamfield_chooser_objects(self):
+        prefetch_streamfield_chooser_objects(
+            self._result_cache,
+            field_names=self._prefetch_streamfield_chooser_field_names,
+        )
+        self._prefetch_streamfield_choosers_done = True
+
+    def _fetch_all(self):
+        super()._fetch_all()
+
+        # Mirrors how Django calls prefetch_related_objects() on the result
+        # cache inside _fetch_all() after the main query has run.
+        if (
+            self._prefetch_streamfield_choosers
+            and not self._prefetch_streamfield_choosers_done
+        ):
+            self._prefetch_streamfield_chooser_objects()
+
+    def iterator(self, chunk_size=None):
+        if chunk_size is None and self._prefetch_streamfield_choosers:
+            raise ValueError(
+                "chunk_size must be provided when using PageQuerySet.iterator() "
+                "after prefetch_streamfield_choosers()."
+            )
+        return super().iterator(chunk_size=chunk_size)
+
+    def _iterator(self, use_chunked_fetch, chunk_size):
+        if not self._prefetch_streamfield_choosers or chunk_size is None:
+            yield from super()._iterator(use_chunked_fetch, chunk_size)
+            return
+
+        iterator = iter(super()._iterator(use_chunked_fetch, chunk_size))
+        while results := list(islice(iterator, chunk_size)):
+            prefetch_streamfield_chooser_objects(
+                results,
+                field_names=self._prefetch_streamfield_chooser_field_names,
+            )
+            yield from results
+
     def prefetch_workflow_states(self):
         """
         Performance optimisation for listing pages.
@@ -650,6 +703,55 @@ class PageQuerySet(SearchableQuerySetMixin, SpecificQuerySetMixin, TreeQuerySet)
                 )
             )
         )
+
+
+def prefetch_streamfield_chooser_objects(pages, field_names=None):
+    """
+    Resolves all StreamField chooser block lookups across the given page
+    instances in one query per distinct model, so that subsequent iteration
+    costs no additional database queries.
+
+    Mirrors Django's prefetch_related_objects(): operates on an already-
+    evaluated list of instances rather than a queryset.  The queryset API is
+    PageQuerySet.prefetch_streamfield_choosers(), which stores the intent and calls
+    this function from _fetch_all() once the result cache is populated.
+    """
+
+    from wagtail.blocks.base import _chooser_cache, _collect_chooser_pks
+    from wagtail.models.pages import get_streamfield_names
+
+    pks_by_model = {}
+    pages_and_fields = []
+
+    for page in pages:
+        names = (
+            field_names
+            if field_names is not None
+            else get_streamfield_names(type(page))
+        )
+        for name in names:
+            sv = getattr(page, name)
+            if not sv.is_lazy or not sv._raw_data:
+                continue
+            page_pks = {}
+            _collect_chooser_pks(sv.stream_block, [sv._raw_data], page_pks)
+            if page_pks:
+                for model, pks in page_pks.items():
+                    pks_by_model.setdefault(model, set()).update(pks)
+                pages_and_fields.append((page, name))
+
+    if not pks_by_model:
+        return
+
+    cache = {model: model.objects.in_bulk(pks) for model, pks in pks_by_model.items()}
+    token = _chooser_cache.set(cache)
+
+    try:
+        for page, name in pages_and_fields:
+            for _ in getattr(page, name):
+                pass
+    finally:
+        _chooser_cache.reset(token)
 
 
 class SpecificIterable(ModelIterable):
